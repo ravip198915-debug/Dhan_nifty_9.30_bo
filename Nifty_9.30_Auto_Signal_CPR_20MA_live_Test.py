@@ -109,6 +109,8 @@ LAST_SPOT_TICK_TS = 0.0
 LAST_ANY_TICK_TS = 0.0
 
 AUTO_SIGNAL="NO TRADE"
+EXECUTION_MODE = "DHAN_PRIMARY"
+LAST_BROKER_USED = "DHAN"
 allowed_side=None
 MA_SIDE=None
 CPR_TYPE=None
@@ -305,6 +307,50 @@ def _fallback_zerodha_order(sym, side, qty):
     except Exception as e:
         print(f"[FALLBACK] Zerodha order error: {e}")
         return None
+
+
+def execute_order(symbol, side, qty):
+    global LAST_BROKER_USED
+    import time
+
+    start = time.time()
+
+    if EXECUTION_MODE == "DHAN_PRIMARY":
+        res = dhan_place_order(symbol, side, qty)
+
+        if _is_dhan_order_failed(res):
+            print("[FAILOVER] DHAN → ZERODHA")
+            LAST_BROKER_USED = "ZERODHA"
+            res = _fallback_zerodha_order(symbol, side, qty)
+        else:
+            LAST_BROKER_USED = "DHAN"
+
+    elif EXECUTION_MODE == "ZERODHA_PRIMARY":
+        res = _fallback_zerodha_order(symbol, side, qty)
+
+        if not res:
+            print("[FAILOVER] ZERODHA → DHAN")
+            LAST_BROKER_USED = "DHAN"
+            res = dhan_place_order(symbol, side, qty)
+        else:
+            LAST_BROKER_USED = "ZERODHA"
+
+    elif EXECUTION_MODE == "DUAL_PARALLEL":
+        print("[DUAL] BOTH BROKERS")
+
+        res = {
+            "dhan": dhan_place_order(symbol, side, qty),
+            "zerodha": _fallback_zerodha_order(symbol, side, qty)
+        }
+
+    else:
+        res = dhan_place_order(symbol, side, qty)
+        LAST_BROKER_USED = "DHAN"
+
+    latency = time.time() - start
+    print(f"[EXECUTION] Mode={EXECUTION_MODE} Broker={LAST_BROKER_USED} Latency={latency:.3f}s")
+
+    return res
 
 
 print("Token test:", CLIENT_ID)
@@ -576,7 +622,7 @@ def place_live_buy(sym):
     global EXIT_DONE, PENDING_ENTRY_SYMBOL, PENDING_ENTRY_FILL
     try:
         dhan_sym = convert_to_dhan_symbol(sym)
-        response = dhan_place_order(dhan_sym, "BUY", LOT_SIZE)
+        response = execute_order(dhan_sym, "BUY", LOT_SIZE)
         print(f"[DHAN EXECUTION] DHAN BUY ORDER: {response}")
 
         if _is_dhan_order_failed(response):
@@ -688,7 +734,7 @@ def place_live_exit(sym):
             return
 
         dhan_sym = convert_to_dhan_symbol(sym)
-        response = dhan_place_order(dhan_sym, "SELL", qty)
+        response = execute_order(dhan_sym, "SELL", qty)
         print(f"[DHAN EXECUTION] DHAN EXIT ORDER: {response}")
         if _is_dhan_order_failed(response):
             print("[FALLBACK] Fallback to Zerodha")
