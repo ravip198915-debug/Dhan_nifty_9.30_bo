@@ -96,12 +96,15 @@ option_ltp=None
 trade_open=False
 ACTIVE_OPTION_TOKEN=None
 ACTIVE_SYMBOL=None
+ACTIVE_SIDE=None
 ORDER_PLACED=False
 BLOCK_MSG_SHOWN=False
 day_closed = False
 SCRIPT_RUNNING = True
 WS_STOPPED = False
 LAST_OPTION_TICK_TS = 0.0
+LAST_SPOT_TICK_TS = 0.0
+LAST_ANY_TICK_TS = 0.0
 
 AUTO_SIGNAL="NO TRADE"
 allowed_side=None
@@ -112,8 +115,13 @@ AUTO_READY = False
 trade={}
 day_closed=False
 PENDING_ENTRY_SYMBOL = None
+PENDING_ENTRY_FILL = False
 OPEN_QTY_CACHE = {"symbol": None, "qty": 0, "ts": 0.0}
 OPEN_QTY_CACHE_TTL = 2.0
+PRE_CE_TOKEN = None
+PRE_PE_TOKEN = None
+PRE_CE_SYMBOL = None
+PRE_PE_SYMBOL = None
 
 candle={"high":None,"low":None}
 candle_done=False
@@ -444,7 +452,32 @@ def fetch_930_candle():
     
     send_telegram("Fetched 9:30 candle successfully")
 
+    pre_subscribe_atm_options()
     calculate_auto_signal()
+
+
+def pre_subscribe_atm_options():
+    global PRE_CE_TOKEN, PRE_PE_TOKEN, PRE_CE_SYMBOL, PRE_PE_SYMBOL
+
+    if spot_ltp is None:
+        return
+
+    ce_sym, ce_tok = get_atm_option(spot_ltp, "CE")
+    pe_sym, pe_tok = get_atm_option(spot_ltp, "PE")
+
+    PRE_CE_SYMBOL, PRE_CE_TOKEN = ce_sym, ce_tok
+    PRE_PE_SYMBOL, PRE_PE_TOKEN = pe_sym, pe_tok
+
+    tokens = []
+    if PRE_CE_TOKEN:
+        tokens.append(PRE_CE_TOKEN)
+    if PRE_PE_TOKEN and str(PRE_PE_TOKEN) != str(PRE_CE_TOKEN):
+        tokens.append(PRE_PE_TOKEN)
+
+    if tokens:
+        kws.subscribe(tokens)
+        kws.set_mode(kws.MODE_LTP, tokens)
+        print(f"Pre-subscribed ATM options CE={PRE_CE_SYMBOL} PE={PRE_PE_SYMBOL}")
     
 
 # ⭐⭐⭐ ADD PENDING ORDER FUNCTION HERE (OUTSIDE THE ABOVE FUNCTION)
@@ -470,7 +503,7 @@ EXIT_DONE = False
 
 # ================= LIVE BUY ORDER =================
 def place_live_buy(sym):
-    global EXIT_DONE, PENDING_ENTRY_SYMBOL
+    global EXIT_DONE, PENDING_ENTRY_SYMBOL, PENDING_ENTRY_FILL
     try:
         # BROKER CHANGE: Dhan place_order with security_id / NSE_FNO
         resp = dhan.place_order(
@@ -487,6 +520,7 @@ def place_live_buy(sym):
         # ✅ Reset exit lock for new trade
         EXIT_DONE = False
         PENDING_ENTRY_SYMBOL = sym
+        PENDING_ENTRY_FILL = True
 
         data = _extract_data(resp)
         avg_price = None
@@ -498,6 +532,9 @@ def place_live_buy(sym):
         if avg_price:
             trade["entry_price"] = avg_price
             trade["prem_entry"] = avg_price
+            PENDING_ENTRY_FILL = False
+
+        trade["qty"] = int(LOT_SIZE)
 
         print(f"{GREEN}LIVE BUY ORDER PLACED : {sym} | {datetime.now().strftime('%H:%M:%S')}{RESET}")
 
@@ -505,9 +542,11 @@ def place_live_buy(sym):
         {sym}
         Time: {datetime.now().strftime('%H:%M:%S')}"""
         send_telegram(msg)
+        return True
 
     except Exception as e:
         print(f"BUY ORDER ERROR : {e}")
+        return False
 
 
 # ================= GET OPEN POSITION QTY =================
@@ -572,12 +611,12 @@ def place_live_exit(sym):
             print("Exit already done — skipping")
             return
 
-        qty = get_open_qty(sym)
-        print("Open Qty Found :", qty)
+        qty = int(trade.get("qty", 0))
+        print("Exit Qty :", qty)
 
         # 🚫 No position exists
         if qty == 0:
-            print("No open position — exit skipped")
+            print("No trade quantity cached — exit skipped")
             return
 
         # BROKER CHANGE: Dhan sell order
@@ -650,7 +689,7 @@ class DhanTickerAdapter:
                     while self._running:
                         tick = feed.get_data()
                         if not tick:
-                            if time.time() - last_tick_ts > 5:
+                            if time.time() - last_tick_ts > 3:
                                 raise ConnectionError("Feed stalled; reconnecting")
                             time.sleep(0.01)
                             continue
@@ -664,7 +703,7 @@ class DhanTickerAdapter:
                     if day_closed:
                         break
                     print(f"Feed reconnect: {e}")
-                    time.sleep(1)
+                    time.sleep(0.5)
             if self.on_close:
                 self.on_close(self, None, None)
 
@@ -697,19 +736,28 @@ def on_ticks(ws, ticks):
     if ws is None:
         ws = kws
 
-    global trade_open, ACTIVE_OPTION_TOKEN, ACTIVE_SYMBOL
+    global trade_open, ACTIVE_OPTION_TOKEN, ACTIVE_SYMBOL, ACTIVE_SIDE
     global ORDER_PLACED, BLOCK_MSG_SHOWN
     global spot_ltp, option_ltp, day_closed, LAST_OPTION_TICK_TS, PENDING_ENTRY_SYMBOL
+    global LAST_SPOT_TICK_TS, LAST_ANY_TICK_TS, PENDING_ENTRY_FILL
 
     now = datetime.now().time()
+    tick_now_ts = time.time()
 
     # ===== UPDATE LTP =====
     for t in ticks:
         if "last_price" in t and str(t.get("instrument_token")) == str(SPOT_TOKEN):
             spot_ltp = t["last_price"]
+            LAST_SPOT_TICK_TS = tick_now_ts
+            LAST_ANY_TICK_TS = tick_now_ts
         if ACTIVE_OPTION_TOKEN and str(t.get("instrument_token")) == str(ACTIVE_OPTION_TOKEN):
             option_ltp = t["last_price"]
-            LAST_OPTION_TICK_TS = time.time()
+            LAST_OPTION_TICK_TS = tick_now_ts
+            LAST_ANY_TICK_TS = tick_now_ts
+            if trade_open and PENDING_ENTRY_FILL and PENDING_ENTRY_SYMBOL == ACTIVE_SYMBOL and "entry_price" not in trade:
+                trade["entry_price"] = option_ltp
+                trade["prem_entry"] = option_ltp
+                PENDING_ENTRY_FILL = False
 
     if not candle_done or day_closed:
         return
@@ -722,9 +770,7 @@ def on_ticks(ws, ticks):
 
         if trade_open and ACTIVE_SYMBOL:
             print(f"{YELLOW}Closing active trade...{RESET}")
-
-            qty = get_open_qty(ACTIVE_SYMBOL)
-            if qty > 0:
+            if int(trade.get("qty", 0)) > 0:
                 place_live_exit(ACTIVE_SYMBOL)
                 print(f"{RED}Position closed for day end{RESET}")
             else:
@@ -781,10 +827,17 @@ def on_ticks(ws, ticks):
         else:
             return
 
-        sym, tok = get_atm_option(spot_ltp, side)
+        if side == "CE":
+            sym, tok = PRE_CE_SYMBOL, PRE_CE_TOKEN
+        else:
+            sym, tok = PRE_PE_SYMBOL, PRE_PE_TOKEN
+
+        if sym is None or tok is None:
+            sym, tok = get_atm_option(spot_ltp, side)
 
         ACTIVE_OPTION_TOKEN = tok
         ACTIVE_SYMBOL = sym
+        ACTIVE_SIDE = side
         if ACTIVE_SYMBOL is None:
            print("ATM option not found — skipping entry")
            return
@@ -794,27 +847,26 @@ def on_ticks(ws, ticks):
             ws.set_mode(ws.MODE_LTP, [tok])
 
         print(f"{BLUE}Trade Executed Date: {date.today()} | {datetime.now().strftime('%H:%M:%S')}{RESET}")
-   
-        ORDER_PLACED = True
-        trade_open = True
         trade.clear()
 
-        place_live_buy(sym)
+        buy_ok = place_live_buy(sym)
+        if not buy_ok:
+            ACTIVE_OPTION_TOKEN = None
+            ACTIVE_SYMBOL = None
+            ACTIVE_SIDE = None
+            return
+
+        ORDER_PLACED = True
+        trade_open = True
         sound_entry()
 
 # ===== MANAGEMENT =====
     # ===== MANAGEMENT =====
     if trade_open:
+        if (time.time() - LAST_OPTION_TICK_TS) > 2:
+            return
+
         if option_ltp is None:
-            return
-
-        qty = get_open_qty(ACTIVE_SYMBOL)
-        if qty is None:
-            return
-
-        if qty == 0:
-            print("Manual exit detected — resetting trade state")
-            trade_open = False
             return
 
         if "prem_entry" not in trade:
@@ -824,7 +876,20 @@ def on_ticks(ws, ticks):
                 trade["prem_entry"] = option_ltp
                 trade["entry_price"] = option_ltp
                 PENDING_ENTRY_SYMBOL = None
+                PENDING_ENTRY_FILL = False
             else:
+                if option_ltp is not None:
+                    trade["prem_entry"] = option_ltp
+                    trade["entry_price"] = option_ltp
+                    PENDING_ENTRY_SYMBOL = None
+                    PENDING_ENTRY_FILL = False
+                else:
+                    return
+
+            if "qty" not in trade:
+                trade["qty"] = int(LOT_SIZE)
+
+            if trade["prem_entry"] is None:
                 return
 
             trade["prem_sl"] = round(trade["prem_entry"] - PREM_SL_PTS,2)
@@ -861,6 +926,7 @@ def on_ticks(ws, ticks):
 
         day_closed = True
         SCRIPT_RUNNING = False
+        trade["qty"] = 0
         safe_kws_stop()
         return
 
