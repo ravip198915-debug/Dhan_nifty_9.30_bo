@@ -231,6 +231,11 @@ print("Downloading instruments...")
 INSTRUMENTS=_download_nfo_master()
 print("NFO instruments loaded")
 
+# ================= OPTION INDEX CACHE =================
+OPTION_INDEX = {}
+NIFTY_EXPIRIES = []
+NEXT_WEEK_EXPIRY = None
+
 # ================= HEADER =================
 def print_header():
     print(f"{GREEN}MODE: OPTION BUYING SCRIPT - LIVE TRADE{RESET}")
@@ -334,37 +339,65 @@ def _parse_expiry(x):
     return None
 
 
-def get_next_expiry():
+def build_option_index():
+    global OPTION_INDEX, NIFTY_EXPIRIES, NEXT_WEEK_EXPIRY
+
+    option_index = {}
+    expiry_set = set()
     today = date.today()
 
-    expiries = sorted(set(
-        _parse_expiry(i.get("SEM_EXPIRY_DATE", "")) for i in INSTRUMENTS
-        if i.get("SEM_CUSTOM_SYMBOL", "").startswith("NIFTY") and _parse_expiry(i.get("SEM_EXPIRY_DATE", "")) and _parse_expiry(i.get("SEM_EXPIRY_DATE", "")) >= today
-    ))
+    for ins in INSTRUMENTS:
+        if not ins.get("SEM_CUSTOM_SYMBOL", "").startswith("NIFTY"):
+            continue
 
-    # ⭐ Always choose NEXT WEEK expiry
-    if len(expiries) > 1:
-        return expiries[1]     # second expiry = next week
-    elif expiries:
-        return expiries[0]     # fallback safety
-    return None
+        expiry = _parse_expiry(ins.get("SEM_EXPIRY_DATE", ""))
+        if not expiry or expiry < today:
+            continue
+
+        opt_type = ins.get("SEM_OPTION_TYPE")
+        if opt_type not in ("CE", "PE"):
+            continue
+
+        try:
+            strike = int(float(ins.get("SEM_STRIKE_PRICE", "0")))
+        except:
+            continue
+
+        option_index[(expiry, strike, opt_type)] = (
+            ins.get("SEM_TRADING_SYMBOL"),
+            ins.get("SEM_SMST_SECURITY_ID"),
+        )
+        expiry_set.add(expiry)
+
+    NIFTY_EXPIRIES = sorted(expiry_set)
+    NEXT_WEEK_EXPIRY = NIFTY_EXPIRIES[1] if len(NIFTY_EXPIRIES) > 1 else (NIFTY_EXPIRIES[0] if NIFTY_EXPIRIES else None)
+    OPTION_INDEX = option_index
 
 
-def get_atm_option(spot,side):
-    strike=round(spot/50)*50
-    expiry=get_next_expiry()
+def get_next_expiry():
+    return NEXT_WEEK_EXPIRY
+
+
+def get_atm_option_fast(spot, side):
+    strike = round(spot / 50) * 50
+    expiry = get_next_expiry()
     print(f"{YELLOW}Using NEXT WEEK Expiry: {expiry}{RESET}")
     if expiry is None:
         return None, None
-    for i in INSTRUMENTS:
-        if (
-            i.get("SEM_CUSTOM_SYMBOL", "").startswith("NIFTY") and
-            _parse_expiry(i.get("SEM_EXPIRY_DATE", "")) == expiry and
-            int(float(i.get("SEM_STRIKE_PRICE", "0"))) == int(strike) and
-            i.get("SEM_OPTION_TYPE") == side
-        ):
-            return i.get("SEM_TRADING_SYMBOL"), i.get("SEM_SMST_SECURITY_ID")
+
+    search_strikes = [strike, strike + 50, strike - 50, strike + 100, strike - 100]
+    for s in search_strikes:
+        hit = OPTION_INDEX.get((expiry, int(s), side))
+        if hit:
+            return hit
     return None, None
+
+
+def get_atm_option(spot, side):
+    return get_atm_option_fast(spot, side)
+
+
+build_option_index()
 
 # ================= FETCH =================
 def fetch_spot():
