@@ -4,13 +4,13 @@
 # ==========================================================
 
 # ================= CONFIG =================
-API_KEY ="ikzievanmkaoalmz"
+CLIENT_ID ="1106176565"
 ACCESS_TOKEN ="927X2ijccpAleBJKsAFvIe9OXBvpMSoS"
 # ==========================================================
 
 
 
-from kiteconnect import KiteConnect, KiteTicker
+from dhanhq import DhanContext, dhanhq, MarketFeed
 from datetime import datetime, date, time as dtime, timedelta
 import time, threading, sys
 
@@ -75,11 +75,11 @@ def send_telegram(msg):
 
 # ================= CONFIG =================
 MODE="LIVE"
-PRODUCT="MIS"
-EXCHANGE="NFO"
+PRODUCT="INTRADAY"
+EXCHANGE="NSE_FNO"
 ORDER_TYPE="MARKET"
 
-SPOT_TOKEN=256265
+SPOT_TOKEN="13"
 LOT_SIZE=130
 
 PREM_SL_PTS=20
@@ -114,13 +114,121 @@ day_closed=False
 candle={"high":None,"low":None}
 candle_done=False
 
-# ================= KITE =================
-kite=KiteConnect(api_key=API_KEY)
-kite.set_access_token(ACCESS_TOKEN)
+# ================= DHAN =================
+# BROKER CHANGE: Kite client replaced with Dhan client/context
+_dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
+dhan = dhanhq(_dhan_context)
 
-print("Token test:",kite.profile()["user_name"])
+
+def _to_float(v):
+    try:
+        return float(v)
+    except:
+        return None
+
+
+def _extract_data(resp):
+    if isinstance(resp, dict):
+        return resp.get("data", resp.get("Data", resp))
+    return resp
+
+
+def _normalize_orders(raw):
+    data = _extract_data(raw)
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _normalize_positions(raw):
+    data = _extract_data(raw)
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _get_ltp_by_security_id(security_id, exchange_segment):
+    # BROKER CHANGE: Dhan LTP fetch
+    try:
+        data = _extract_data(dhan.get_ltp(security_id=str(security_id), exchange_segment=exchange_segment))
+        if isinstance(data, dict):
+            if "last_price" in data:
+                return _to_float(data.get("last_price"))
+            if "last_traded_price" in data:
+                return _to_float(data.get("last_traded_price"))
+            if "ltp" in data:
+                return _to_float(data.get("ltp"))
+        if isinstance(data, list) and data:
+            row = data[0]
+            return _to_float(row.get("last_price", row.get("last_traded_price", row.get("ltp"))))
+    except:
+        pass
+    return None
+
+
+def _historical_daily(security_id, from_date, to_date):
+    # BROKER CHANGE: Dhan historical daily fetch
+    try:
+        resp = dhan.historical_daily_data(
+            security_id=str(security_id),
+            exchange_segment=dhan.NSE_IDX,
+            instrument_type="INDEX",
+            from_date=from_date.strftime("%Y-%m-%d"),
+            to_date=to_date.strftime("%Y-%m-%d")
+        )
+        rows = _extract_data(resp)
+        if isinstance(rows, list):
+            return rows
+    except:
+        pass
+    return []
+
+
+def _historical_intraday_5m(security_id, from_dt, to_dt):
+    # BROKER CHANGE: Dhan intraday minute fetch
+    try:
+        resp = dhan.intraday_minute_data(
+            security_id=str(security_id),
+            exchange_segment=dhan.NSE_IDX,
+            instrument_type="INDEX",
+            interval=5,
+            from_date=from_dt.strftime("%Y-%m-%d"),
+            to_date=to_dt.strftime("%Y-%m-%d")
+        )
+        rows = _extract_data(resp)
+        if isinstance(rows, list):
+            return rows
+    except:
+        pass
+    return []
+
+
+def _download_nfo_master():
+    # BROKER CHANGE: Dhan security master for options mapping (security_id)
+    url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+    rows = []
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        lines = r.text.splitlines()
+        if not lines:
+            return rows
+        headers = [h.strip() for h in lines[0].split(",")]
+        for ln in lines[1:]:
+            cols = ln.split(",")
+            if len(cols) != len(headers):
+                continue
+            d = {headers[i]: cols[i].strip() for i in range(len(headers))}
+            if d.get("SEM_EXM_EXCH_ID") == "NSE" and d.get("SEM_SEGMENT") == "FNO":
+                rows.append(d)
+    except Exception as e:
+        print("Instrument download error:", e)
+    return rows
+
+
+print("Token test:", CLIENT_ID)
 print("Downloading instruments...")
-INSTRUMENTS=kite.instruments("NFO")
+INSTRUMENTS=_download_nfo_master()
 print("NFO instruments loaded")
 
 # ================= HEADER =================
@@ -151,11 +259,10 @@ def calculate_auto_signal():
     today = date.today()
 
     # ⭐ SINGLE DAILY DATA FETCH (used for CPR + MA20)
-    hist = kite.historical_data(
+    hist = _historical_daily(
         SPOT_TOKEN,
         today - timedelta(days=50),   # buffer for holidays
-        today,
-        "day"
+        today
     )
 
     if not hist or len(hist) < 22:
@@ -167,9 +274,9 @@ def calculate_auto_signal():
     # ==========================================================
     d = hist[-2]
 
-    PDH = d["high"]
-    PDL = d["low"]
-    PDC = d["close"]
+    PDH = _to_float(d.get("high", d.get("High")))
+    PDL = _to_float(d.get("low", d.get("Low")))
+    PDC = _to_float(d.get("close", d.get("Close")))
 
     # ================= CPR =================
     pivot = (PDH + PDL + PDC) / 3
@@ -186,7 +293,7 @@ def calculate_auto_signal():
         CPR_TYPE = "NORMAL"
 
     # ================= MA20 =================
-    closes = [i["close"] for i in hist[:-1]]   # exclude today
+    closes = [_to_float(i.get("close", i.get("Close"))) for i in hist[:-1]]   # exclude today
     ma20 = sum(closes[-20:]) / 20
 
     MA_SIDE = "Above" if PDC > ma20 else "Below"
@@ -218,40 +325,58 @@ def calculate_auto_signal():
     AUTO_READY = True
 # ================= EXPIRY =================
 
+def _parse_expiry(x):
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(x, fmt).date()
+        except:
+            pass
+    return None
+
+
 def get_next_expiry():
     today = date.today()
 
     expiries = sorted(set(
-        i["expiry"] for i in INSTRUMENTS
-        if i["name"] == "NIFTY" and i["expiry"] >= today
+        _parse_expiry(i.get("SEM_EXPIRY_DATE", "")) for i in INSTRUMENTS
+        if i.get("SEM_CUSTOM_SYMBOL", "").startswith("NIFTY") and _parse_expiry(i.get("SEM_EXPIRY_DATE", "")) and _parse_expiry(i.get("SEM_EXPIRY_DATE", "")) >= today
     ))
 
     # ⭐ Always choose NEXT WEEK expiry
     if len(expiries) > 1:
         return expiries[1]     # second expiry = next week
-    else:
+    elif expiries:
         return expiries[0]     # fallback safety
+    return None
 
 
 def get_atm_option(spot,side):
     strike=round(spot/50)*50
     expiry=get_next_expiry()
     print(f"{YELLOW}Using NEXT WEEK Expiry: {expiry}{RESET}")
+    if expiry is None:
+        return None, None
     for i in INSTRUMENTS:
-        if i["name"]=="NIFTY" and i["expiry"]==expiry and i["strike"]==strike and i["instrument_type"]==side:
-            return i["tradingsymbol"],i["instrument_token"]
+        if (
+            i.get("SEM_CUSTOM_SYMBOL", "").startswith("NIFTY") and
+            _parse_expiry(i.get("SEM_EXPIRY_DATE", "")) == expiry and
+            int(float(i.get("SEM_STRIKE_PRICE", "0"))) == int(strike) and
+            i.get("SEM_OPTION_TYPE") == side
+        ):
+            return i.get("SEM_TRADING_SYMBOL"), i.get("SEM_SMST_SECURITY_ID")
+    return None, None
 
 # ================= FETCH =================
 def fetch_spot():
     global spot_ltp
     try:
-        spot_ltp=kite.ltp(["NSE:NIFTY 50"])["NSE:NIFTY 50"]["last_price"]
+        spot_ltp=_get_ltp_by_security_id(SPOT_TOKEN, dhan.NSE_IDX)
     except: pass
 
 def fetch_option_ltp():
     global option_ltp
     try:
-        option_ltp=list(kite.ltp([ACTIVE_OPTION_TOKEN]).values())[0]["last_price"]
+        option_ltp=_get_ltp_by_security_id(ACTIVE_OPTION_TOKEN, dhan.NSE_FNO)
     except: pass
 
 # ================= 9:30 CANDLE =================
@@ -269,11 +394,10 @@ def fetch_930_candle():
         print("Market not opened yet – waiting for 9:30 candle")
         return
 
-    data = kite.historical_data(
+    data = _historical_intraday_5m(
         SPOT_TOKEN,
         datetime.combine(today, dtime(9,30)),
-        datetime.combine(today, dtime(9,35)),
-        "5minute"
+        datetime.combine(today, dtime(9,35))
     )
 
     # ⭐ AFTER 9:35 — if still no data → holiday
@@ -281,8 +405,8 @@ def fetch_930_candle():
         print("No 9:30 candle data – possible holiday")
         sys.exit(0)
 
-    candle["high"] = data[0]["high"]
-    candle["low"] = data[0]["low"]
+    candle["high"] = _to_float(data[0].get("high", data[0].get("High")))
+    candle["low"] = _to_float(data[0].get("low", data[0].get("Low")))
     candle_done = True
 
     print(f"{GREEN}Fetched 9:30 candle successfully{RESET}")
@@ -295,11 +419,11 @@ def fetch_930_candle():
 # ⭐⭐⭐ ADD PENDING ORDER FUNCTION HERE (OUTSIDE THE ABOVE FUNCTION)
 def has_pending_order(sym):
     try:
-        orders = kite.orders()
+        orders = _normalize_orders(dhan.get_order_list())
         for o in orders:
             if (
-                o["tradingsymbol"] == sym and
-                o["status"] in ["OPEN","TRIGGER PENDING","PUT ORDER REQ RECEIVED"]
+                o.get("tradingSymbol", o.get("tradingsymbol")) == sym and
+                o.get("orderStatus", o.get("status")) in ["OPEN","TRIGGER PENDING","PUT ORDER REQ RECEIVED","PENDING"]
             ):
                 return True
     except Exception as e:
@@ -311,14 +435,14 @@ def has_pending_order(sym):
 # ================= GET LAST FILLED BUY PRICE =================
 def get_last_fill_price(sym):
     try:
-        orders = kite.orders()[::-1]
+        orders = _normalize_orders(dhan.get_order_list())[::-1]
         for o in orders:
             if (
-                o["tradingsymbol"] == sym and
-                o["transaction_type"] == "BUY" and
-                o["status"] == "COMPLETE"
+                o.get("tradingSymbol", o.get("tradingsymbol")) == sym and
+                o.get("transactionType", o.get("transaction_type")) == "BUY" and
+                o.get("orderStatus", o.get("status")) == "TRADED"
             ):
-                return float(o["average_price"])
+                return float(o.get("averagePrice", o.get("average_price", 0)))
     except Exception as e:
         print("Fill price fetch error:", e)
     return None
@@ -334,14 +458,16 @@ EXIT_DONE = False
 def place_live_buy(sym):
     global EXIT_DONE
     try:
-        kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=EXCHANGE,
-            tradingsymbol=sym,
-            transaction_type=kite.TRANSACTION_TYPE_BUY,
-            quantity=LOT_SIZE,
-            product=PRODUCT,
-            order_type=ORDER_TYPE
+        # BROKER CHANGE: Dhan place_order with security_id / NSE_FNO
+        dhan.place_order(
+            security_id=str(ACTIVE_OPTION_TOKEN),
+            exchange_segment=EXCHANGE,
+            transaction_type="BUY",
+            quantity=int(LOT_SIZE),
+            order_type=ORDER_TYPE,
+            product_type=PRODUCT,
+            price=0,
+            validity="DAY"
         )
 
         # ✅ Reset exit lock for new trade
@@ -362,11 +488,13 @@ def place_live_buy(sym):
 def get_open_qty(sym):
 
     try:
-        pos = kite.positions()["net"]
+        pos = _normalize_positions(dhan.get_positions())
 
         for p in pos:
-            if p["tradingsymbol"] == sym and abs(p["quantity"]) > 0:
-                return abs(p["quantity"])
+            p_sym = p.get("tradingSymbol", p.get("tradingsymbol"))
+            p_qty = abs(int(float(p.get("netQty", p.get("quantity", 0)))))
+            if p_sym == sym and p_qty > 0:
+                return p_qty
 
         return 0
 
@@ -381,13 +509,15 @@ def recover_position():
     global trade_open, ACTIVE_SYMBOL
 
     try:
-        pos = kite.positions()["net"]
+        pos = _normalize_positions(dhan.get_positions())
 
         for p in pos:
-            if abs(p["quantity"]) > 0 and p["product"] == PRODUCT:
+            p_qty = abs(int(float(p.get("netQty", p.get("quantity", 0)))))
+            p_product = p.get("productType", p.get("product"))
+            if p_qty > 0 and p_product == PRODUCT:
 
                 trade_open = True
-                ACTIVE_SYMBOL = p["tradingsymbol"]
+                ACTIVE_SYMBOL = p.get("tradingSymbol", p.get("tradingsymbol"))
 
                 print("Recovered existing position:", ACTIVE_SYMBOL)
 
@@ -415,14 +545,16 @@ def place_live_exit(sym):
             print("No open position — exit skipped")
             return
 
-        kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=EXCHANGE,
-            tradingsymbol=sym,
-            transaction_type=kite.TRANSACTION_TYPE_SELL,
-            quantity=qty,   # ✅ Use actual open quantity
-            product=PRODUCT,
-            order_type=ORDER_TYPE
+        # BROKER CHANGE: Dhan sell order
+        dhan.place_order(
+            security_id=str(ACTIVE_OPTION_TOKEN),
+            exchange_segment=EXCHANGE,
+            transaction_type="SELL",
+            quantity=int(qty),   # ✅ Use actual open quantity
+            order_type=ORDER_TYPE,
+            product_type=PRODUCT,
+            price=0,
+            validity="DAY"
         )
 
         EXIT_DONE = True
@@ -433,6 +565,73 @@ def place_live_exit(sym):
 
 
 # ================= WEBSOCKET =================
+# BROKER CHANGE: Dhan feed adapter to preserve KiteTicker-style callbacks
+class DhanTickerAdapter:
+    MODE_LTP = "LTP"
+
+    def __init__(self, client_id, access_token):
+        self.client_id = client_id
+        self.access_token = access_token
+        self._subs = set()
+        self._running = False
+        self.on_ticks = None
+        self.on_connect = None
+        self.on_close = None
+        self._thread = None
+
+    def _to_feed_tuple(self, security_id):
+        sid = str(security_id)
+        if sid == str(SPOT_TOKEN):
+            return (MarketFeed.IDX, sid, MarketFeed.Ticker)
+        return (MarketFeed.NSE_FNO, sid, MarketFeed.Ticker)
+
+    def subscribe(self, tokens):
+        for t in tokens:
+            self._subs.add(str(t))
+
+    def set_mode(self, mode, tokens):
+        return
+
+    def stop(self):
+        self._running = False
+
+    def connect(self, threaded=True):
+        self._running = True
+
+        def _runner():
+            if self.on_connect:
+                self.on_connect(self, None)
+            while self._running:
+                if not self._subs:
+                    time.sleep(0.2)
+                    continue
+                instruments = [self._to_feed_tuple(s) for s in sorted(self._subs)]
+                try:
+                    feed = MarketFeed(_dhan_context, instruments, "v2")
+                    while self._running:
+                        feed.run_forever()
+                        tick = feed.get_data()
+                        if not tick:
+                            continue
+
+                        secid = str(tick.get("security_id", tick.get("securityId", "")))
+                        ltp = _to_float(tick.get("LTP", tick.get("last_price", tick.get("ltp"))))
+                        if secid and ltp is not None and self.on_ticks:
+                            self.on_ticks(self, [{"instrument_token": secid, "last_price": ltp}])
+                except Exception:
+                    if day_closed:
+                        break
+                    time.sleep(1)
+            if self.on_close:
+                self.on_close(self, None, None)
+
+        if threaded:
+            self._thread = threading.Thread(target=_runner, daemon=True)
+            self._thread.start()
+        else:
+            _runner()
+
+
 def on_connect(ws,r):
     print("WebSocket connected")
     ws.subscribe([SPOT_TOKEN])
@@ -463,9 +662,9 @@ def on_ticks(ws, ticks):
 
     # ===== UPDATE LTP =====
     for t in ticks:
-        if "last_price" in t:
+        if "last_price" in t and str(t.get("instrument_token")) == str(SPOT_TOKEN):
             spot_ltp = t["last_price"]
-        if ACTIVE_OPTION_TOKEN and t.get("instrument_token") == ACTIVE_OPTION_TOKEN:
+        if ACTIVE_OPTION_TOKEN and str(t.get("instrument_token")) == str(ACTIVE_OPTION_TOKEN):
             option_ltp = t["last_price"]
 
     if not candle_done or day_closed:
@@ -665,7 +864,7 @@ print_header()
 
 recover_position()
 
-kws = KiteTicker(API_KEY, ACCESS_TOKEN)
+kws = DhanTickerAdapter(CLIENT_ID, ACCESS_TOKEN)
 kws.on_ticks = on_ticks
 kws.on_connect = on_connect
 kws.on_close = on_close
