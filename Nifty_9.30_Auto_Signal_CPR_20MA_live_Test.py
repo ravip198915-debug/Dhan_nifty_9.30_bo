@@ -298,9 +298,10 @@ def execute_order(symbol, side, qty):
     res = dhan_place_order(symbol, side, qty)
 
     if _is_dhan_order_failed(res):
-        print("[CRITICAL] ORDER EXECUTION FAILURE")
-        print("[CRITICAL] DHAN ORDER FAILED — NO FALLBACK")
-        send_telegram("🚨 DHAN ORDER FAILED — MANUAL ACTION REQUIRED")
+        print(f"[CRITICAL] DHAN ORDER FAILED | symbol={symbol} side={side} qty={qty}")
+        send_telegram(f"🚨 DHAN FAILED | {symbol} {side} {qty}")
+    else:
+        print(f"[SUCCESS] {side} ORDER PLACED | {symbol} | Qty={qty}")
 
     LAST_BROKER_USED = "DHAN"
     latency = time.time() - start
@@ -582,8 +583,8 @@ def place_live_buy(sym):
         print(f"[DHAN EXECUTION] DHAN BUY ORDER: {response}")
 
         if _is_dhan_order_failed(response):
-            print("[ERROR] BUY ORDER FAILED")
-            send_telegram("🚨 BUY ORDER FAILED — CHECK MANUALLY")
+            print(f"[ERROR] BUY FAILED | {sym}")
+            send_telegram(f"🚨 BUY FAILED | {sym}")
             return False
 
         # ✅ Reset exit lock for new trade
@@ -692,8 +693,8 @@ def place_live_exit(sym):
         response = execute_order(dhan_sym, "SELL", qty)
         print(f"[DHAN EXECUTION] DHAN EXIT ORDER: {response}")
         if _is_dhan_order_failed(response):
-            print("[ERROR] EXIT ORDER FAILED")
-            send_telegram("🚨 EXIT ORDER FAILED — CHECK MANUALLY")
+            print(f"[ERROR] EXIT FAILED | {sym}")
+            send_telegram(f"🚨 EXIT FAILED | {sym}")
             return
 
         EXIT_DONE = True
