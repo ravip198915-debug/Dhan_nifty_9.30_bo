@@ -289,66 +289,21 @@ def dhan_place_order(symbol, side, qty):
         return None
 
 
-def _fallback_zerodha_order(sym, side, qty):
-    try:
-        if "kite" not in globals() or kite is None:
-            print(f"[FALLBACK] Zerodha client unavailable for {sym} {side} {qty}")
-            return None
-        txn_type = kite.TRANSACTION_TYPE_BUY if side == "BUY" else kite.TRANSACTION_TYPE_SELL
-        return kite.place_order(
-            variety=kite.VARIETY_REGULAR,
-            exchange=kite.EXCHANGE_NFO,
-            tradingsymbol=sym,
-            transaction_type=txn_type,
-            quantity=int(qty),
-            product=kite.PRODUCT_MIS,
-            order_type=kite.ORDER_TYPE_MARKET
-        )
-    except Exception as e:
-        print(f"[FALLBACK] Zerodha order error: {e}")
-        return None
-
-
 def execute_order(symbol, side, qty):
     global LAST_BROKER_USED
     import time
 
     start = time.time()
 
-    if EXECUTION_MODE == "DHAN_PRIMARY":
-        res = dhan_place_order(symbol, side, qty)
+    res = dhan_place_order(symbol, side, qty)
 
-        if _is_dhan_order_failed(res):
-            print("[FAILOVER] DHAN → ZERODHA")
-            LAST_BROKER_USED = "ZERODHA"
-            res = _fallback_zerodha_order(symbol, side, qty)
-        else:
-            LAST_BROKER_USED = "DHAN"
+    if _is_dhan_order_failed(res):
+        print("[CRITICAL] DHAN ORDER FAILED — NO FALLBACK")
+        send_telegram("🚨 DHAN ORDER FAILED — MANUAL ACTION REQUIRED")
 
-    elif EXECUTION_MODE == "ZERODHA_PRIMARY":
-        res = _fallback_zerodha_order(symbol, side, qty)
-
-        if not res:
-            print("[FAILOVER] ZERODHA → DHAN")
-            LAST_BROKER_USED = "DHAN"
-            res = dhan_place_order(symbol, side, qty)
-        else:
-            LAST_BROKER_USED = "ZERODHA"
-
-    elif EXECUTION_MODE == "DUAL_PARALLEL":
-        print("[DUAL] BOTH BROKERS")
-
-        res = {
-            "dhan": dhan_place_order(symbol, side, qty),
-            "zerodha": _fallback_zerodha_order(symbol, side, qty)
-        }
-
-    else:
-        res = dhan_place_order(symbol, side, qty)
-        LAST_BROKER_USED = "DHAN"
-
+    LAST_BROKER_USED = "DHAN"
     latency = time.time() - start
-    print(f"[EXECUTION] Mode={EXECUTION_MODE} Broker={LAST_BROKER_USED} Latency={latency:.3f}s")
+    print(f"[EXECUTION] Broker=DHAN Latency={latency:.3f}s")
 
     return res
 
@@ -626,10 +581,7 @@ def place_live_buy(sym):
         print(f"[DHAN EXECUTION] DHAN BUY ORDER: {response}")
 
         if _is_dhan_order_failed(response):
-            print("[FALLBACK] Fallback to Zerodha")
-            response = _fallback_zerodha_order(sym, "BUY", LOT_SIZE)
-            if not response:
-                return False
+            return False
 
         # ✅ Reset exit lock for new trade
         EXIT_DONE = False
@@ -737,11 +689,7 @@ def place_live_exit(sym):
         response = execute_order(dhan_sym, "SELL", qty)
         print(f"[DHAN EXECUTION] DHAN EXIT ORDER: {response}")
         if _is_dhan_order_failed(response):
-            print("[FALLBACK] Fallback to Zerodha")
-            response = _fallback_zerodha_order(sym, "SELL", qty)
-            if not response:
-                print("[FALLBACK] Zerodha exit also failed")
-                return
+            return
 
         EXIT_DONE = True
         OPEN_QTY_CACHE = {"symbol": sym, "qty": 0, "ts": time.time()}
