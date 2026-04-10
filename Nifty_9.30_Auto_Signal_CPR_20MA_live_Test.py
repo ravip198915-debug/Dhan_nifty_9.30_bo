@@ -101,6 +101,7 @@ BLOCK_MSG_SHOWN=False
 day_closed = False
 SCRIPT_RUNNING = True
 WS_STOPPED = False
+LAST_OPTION_TICK_TS = 0.0
 
 AUTO_SIGNAL="NO TRADE"
 allowed_side=None
@@ -110,6 +111,9 @@ AUTO_READY = False
 
 trade={}
 day_closed=False
+PENDING_ENTRY_SYMBOL = None
+OPEN_QTY_CACHE = {"symbol": None, "qty": 0, "ts": 0.0}
+OPEN_QTY_CACHE_TTL = 2.0
 
 candle={"high":None,"low":None}
 candle_done=False
@@ -406,12 +410,6 @@ def fetch_spot():
         spot_ltp=_get_ltp_by_security_id(SPOT_TOKEN, dhan.NSE_IDX)
     except: pass
 
-def fetch_option_ltp():
-    global option_ltp
-    try:
-        option_ltp=_get_ltp_by_security_id(ACTIVE_OPTION_TOKEN, dhan.NSE_FNO)
-    except: pass
-
 # ================= 9:30 CANDLE =================
 def fetch_930_candle():
     global candle_done
@@ -464,23 +462,6 @@ def has_pending_order(sym):
     return False
 
 
-# ⭐⭐⭐ ADD HERE (same indentation level)
-# ================= GET LAST FILLED BUY PRICE =================
-def get_last_fill_price(sym):
-    try:
-        orders = _normalize_orders(dhan.get_order_list())[::-1]
-        for o in orders:
-            if (
-                o.get("tradingSymbol", o.get("tradingsymbol")) == sym and
-                o.get("transactionType", o.get("transaction_type")) == "BUY" and
-                o.get("orderStatus", o.get("status")) == "TRADED"
-            ):
-                return float(o.get("averagePrice", o.get("average_price", 0)))
-    except Exception as e:
-        print("Fill price fetch error:", e)
-    return None
-
-
 # ================= LIVE ORDER BLOCK (SAFE VERSION) =================
 
 # Global exit lock (prevents duplicate exits from heartbeat)
@@ -489,10 +470,10 @@ EXIT_DONE = False
 
 # ================= LIVE BUY ORDER =================
 def place_live_buy(sym):
-    global EXIT_DONE
+    global EXIT_DONE, PENDING_ENTRY_SYMBOL
     try:
         # BROKER CHANGE: Dhan place_order with security_id / NSE_FNO
-        dhan.place_order(
+        resp = dhan.place_order(
             security_id=str(ACTIVE_OPTION_TOKEN),
             exchange_segment=EXCHANGE,
             transaction_type="BUY",
@@ -505,6 +486,18 @@ def place_live_buy(sym):
 
         # ✅ Reset exit lock for new trade
         EXIT_DONE = False
+        PENDING_ENTRY_SYMBOL = sym
+
+        data = _extract_data(resp)
+        avg_price = None
+        if isinstance(data, dict):
+            avg_price = _to_float(
+                data.get("averagePrice", data.get("average_price", data.get("tradedPrice", data.get("traded_price"))))
+            )
+
+        if avg_price:
+            trade["entry_price"] = avg_price
+            trade["prem_entry"] = avg_price
 
         print(f"{GREEN}LIVE BUY ORDER PLACED : {sym} | {datetime.now().strftime('%H:%M:%S')}{RESET}")
 
@@ -519,16 +512,25 @@ def place_live_buy(sym):
 
 # ================= GET OPEN POSITION QTY =================
 def get_open_qty(sym):
-
+    global OPEN_QTY_CACHE
     try:
+        now_ts = time.time()
+        if (
+            OPEN_QTY_CACHE["symbol"] == sym and
+            (now_ts - OPEN_QTY_CACHE["ts"]) <= OPEN_QTY_CACHE_TTL
+        ):
+            return OPEN_QTY_CACHE["qty"]
+
         pos = _normalize_positions(dhan.get_positions())
 
         for p in pos:
             p_sym = p.get("tradingSymbol", p.get("tradingsymbol"))
             p_qty = abs(int(float(p.get("netQty", p.get("quantity", 0)))))
             if p_sym == sym and p_qty > 0:
+                OPEN_QTY_CACHE = {"symbol": sym, "qty": p_qty, "ts": now_ts}
                 return p_qty
 
+        OPEN_QTY_CACHE = {"symbol": sym, "qty": 0, "ts": now_ts}
         return 0
 
     except Exception as e:
@@ -562,7 +564,7 @@ def recover_position():
 
 # ================= SAFE EXIT ORDER =================
 def place_live_exit(sym):
-    global EXIT_DONE
+    global EXIT_DONE, OPEN_QTY_CACHE
 
     try:
         # 🚫 Prevent duplicate exit
@@ -591,6 +593,7 @@ def place_live_exit(sym):
         )
 
         EXIT_DONE = True
+        OPEN_QTY_CACHE = {"symbol": sym, "qty": 0, "ts": time.time()}
         print(f"{RED}LIVE EXIT ORDER : {sym}{RESET}")
 
     except Exception as e:
@@ -641,19 +644,26 @@ class DhanTickerAdapter:
                 instruments = [self._to_feed_tuple(s) for s in sorted(self._subs)]
                 try:
                     feed = MarketFeed(_dhan_context, instruments, "v2")
+                    ws_thread = threading.Thread(target=feed.run_forever, daemon=True)
+                    ws_thread.start()
+                    last_tick_ts = time.time()
                     while self._running:
-                        feed.run_forever()
                         tick = feed.get_data()
                         if not tick:
+                            if time.time() - last_tick_ts > 5:
+                                raise ConnectionError("Feed stalled; reconnecting")
+                            time.sleep(0.01)
                             continue
 
                         secid = str(tick.get("security_id", tick.get("securityId", "")))
                         ltp = _to_float(tick.get("LTP", tick.get("last_price", tick.get("ltp"))))
                         if secid and ltp is not None and self.on_ticks:
+                            last_tick_ts = time.time()
                             self.on_ticks(self, [{"instrument_token": secid, "last_price": ltp}])
-                except Exception:
+                except Exception as e:
                     if day_closed:
                         break
+                    print(f"Feed reconnect: {e}")
                     time.sleep(1)
             if self.on_close:
                 self.on_close(self, None, None)
@@ -689,7 +699,7 @@ def on_ticks(ws, ticks):
 
     global trade_open, ACTIVE_OPTION_TOKEN, ACTIVE_SYMBOL
     global ORDER_PLACED, BLOCK_MSG_SHOWN
-    global spot_ltp, option_ltp, day_closed
+    global spot_ltp, option_ltp, day_closed, LAST_OPTION_TICK_TS, PENDING_ENTRY_SYMBOL
 
     now = datetime.now().time()
 
@@ -699,6 +709,7 @@ def on_ticks(ws, ticks):
             spot_ltp = t["last_price"]
         if ACTIVE_OPTION_TOKEN and str(t.get("instrument_token")) == str(ACTIVE_OPTION_TOKEN):
             option_ltp = t["last_price"]
+            LAST_OPTION_TICK_TS = time.time()
 
     if not candle_done or day_closed:
         return
@@ -774,15 +785,9 @@ def on_ticks(ws, ticks):
 
         ACTIVE_OPTION_TOKEN = tok
         ACTIVE_SYMBOL = sym
-        # ⭐ ADD THIS SAFETY CHECK HERE
         if ACTIVE_SYMBOL is None:
            print("ATM option not found — skipping entry")
            return
-
-        # ⭐ POSITION SAFETY (ADD THIS)
-        if get_open_qty(sym) > 0:
-            print("Position already exists — skipping entry")
-            return
 
         if ws:
             ws.subscribe([tok])
@@ -790,11 +795,6 @@ def on_ticks(ws, ticks):
 
         print(f"{BLUE}Trade Executed Date: {date.today()} | {datetime.now().strftime('%H:%M:%S')}{RESET}")
    
-        # ⭐ Pending order protection
-        if has_pending_order(sym):
-            print("Order already pending — skipping duplicate entry")
-            return
-
         ORDER_PLACED = True
         trade_open = True
         trade.clear()
@@ -805,14 +805,10 @@ def on_ticks(ws, ticks):
 # ===== MANAGEMENT =====
     # ===== MANAGEMENT =====
     if trade_open:
-
-        fetch_option_ltp()
         if option_ltp is None:
             return
 
-        # ⭐ Detect manual exit (SAFE VERSION)
         qty = get_open_qty(ACTIVE_SYMBOL)
-         
         if qty is None:
             return
 
@@ -821,26 +817,15 @@ def on_ticks(ws, ticks):
             trade_open = False
             return
 
-        qty = get_open_qty(ACTIVE_SYMBOL)
-        # API failure → skip check
-        if qty is None:
-            return 
-
-        # True manual exit
-        if qty == 0:
-            print("Manual exit detected — resetting trade state")
-            trade_open = False
-            return
-
-        # ⭐ Fill-price entry logic INSIDE trade_open
         if "prem_entry" not in trade:
-
-            fill_price = get_last_fill_price(ACTIVE_SYMBOL)
-
-            if fill_price:
-                trade["prem_entry"] = fill_price
-            else:
+            if trade.get("entry_price"):
+                trade["prem_entry"] = trade["entry_price"]
+            elif PENDING_ENTRY_SYMBOL == ACTIVE_SYMBOL and option_ltp is not None:
                 trade["prem_entry"] = option_ltp
+                trade["entry_price"] = option_ltp
+                PENDING_ENTRY_SYMBOL = None
+            else:
+                return
 
             trade["prem_sl"] = round(trade["prem_entry"] - PREM_SL_PTS,2)
             trade["prem_target"] = round(trade["prem_entry"] + PREM_TGT_PTS,2)
