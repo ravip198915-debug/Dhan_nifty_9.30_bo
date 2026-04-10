@@ -6,6 +6,8 @@
 # ================= CONFIG =================
 CLIENT_ID ="1106176565"
 ACCESS_TOKEN ="927X2ijccpAleBJKsAFvIe9OXBvpMSoS"
+DHAN_CLIENT_ID = "YOUR_CLIENT_ID"
+DHAN_ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
 # ==========================================================
 
 
@@ -238,6 +240,73 @@ def _download_nfo_master():
     return rows
 
 
+def convert_to_dhan_symbol(sym):
+    import re
+    strike = re.findall(r"\d{5}", str(sym))
+    if not strike:
+        return sym
+    strike = strike[0]
+    if "CE" in str(sym):
+        return f"NIFTY {strike} CE"
+    return f"NIFTY {strike} PE"
+
+
+def _is_dhan_order_failed(response):
+    if response is None:
+        return True
+    if not isinstance(response, dict):
+        return False
+    status = str(response.get("status", response.get("orderStatus", ""))).upper()
+    if status in {"FAILED", "REJECTED", "ERROR"}:
+        return True
+    if response.get("errorCode") or response.get("error"):
+        return True
+    return False
+
+
+def dhan_place_order(symbol, side, qty):
+    url = "https://api.dhan.co/orders"
+    headers = {
+        "access-token": DHAN_ACCESS_TOKEN if DHAN_ACCESS_TOKEN != "YOUR_ACCESS_TOKEN" else ACCESS_TOKEN,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "dhanClientId": DHAN_CLIENT_ID if DHAN_CLIENT_ID != "YOUR_CLIENT_ID" else CLIENT_ID,
+        "transactionType": side,
+        "exchangeSegment": "NSE_FNO",
+        "productType": "INTRADAY",
+        "orderType": "MARKET",
+        "quantity": int(qty),
+        "instrument": symbol,
+    }
+    try:
+        res = requests.post(url, json=payload, headers=headers, timeout=5)
+        return res.json()
+    except Exception as e:
+        print("[DHAN EXECUTION] Dhan order error:", e)
+        return None
+
+
+def _fallback_zerodha_order(sym, side, qty):
+    try:
+        if "kite" not in globals() or kite is None:
+            print(f"[FALLBACK] Zerodha client unavailable for {sym} {side} {qty}")
+            return None
+        txn_type = kite.TRANSACTION_TYPE_BUY if side == "BUY" else kite.TRANSACTION_TYPE_SELL
+        return kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange=kite.EXCHANGE_NFO,
+            tradingsymbol=sym,
+            transaction_type=txn_type,
+            quantity=int(qty),
+            product=kite.PRODUCT_MIS,
+            order_type=kite.ORDER_TYPE_MARKET
+        )
+    except Exception as e:
+        print(f"[FALLBACK] Zerodha order error: {e}")
+        return None
+
+
 print("Token test:", CLIENT_ID)
 print("Downloading instruments...")
 INSTRUMENTS=_download_nfo_master()
@@ -416,7 +485,8 @@ def fetch_spot():
     global spot_ltp
     try:
         spot_ltp=_get_ltp_by_security_id(SPOT_TOKEN, dhan.NSE_IDX)
-    except: pass
+    except Exception as e:
+        print(f"[ZERODHA DATA] Spot fetch error: {e}")
 
 # ================= 9:30 CANDLE =================
 def fetch_930_candle():
@@ -505,24 +575,22 @@ EXIT_DONE = False
 def place_live_buy(sym):
     global EXIT_DONE, PENDING_ENTRY_SYMBOL, PENDING_ENTRY_FILL
     try:
-        # BROKER CHANGE: Dhan place_order with security_id / NSE_FNO
-        resp = dhan.place_order(
-            security_id=str(ACTIVE_OPTION_TOKEN),
-            exchange_segment=EXCHANGE,
-            transaction_type="BUY",
-            quantity=int(LOT_SIZE),
-            order_type=ORDER_TYPE,
-            product_type=PRODUCT,
-            price=0,
-            validity="DAY"
-        )
+        dhan_sym = convert_to_dhan_symbol(sym)
+        response = dhan_place_order(dhan_sym, "BUY", LOT_SIZE)
+        print(f"[DHAN EXECUTION] DHAN BUY ORDER: {response}")
+
+        if _is_dhan_order_failed(response):
+            print("[FALLBACK] Fallback to Zerodha")
+            response = _fallback_zerodha_order(sym, "BUY", LOT_SIZE)
+            if not response:
+                return False
 
         # ✅ Reset exit lock for new trade
         EXIT_DONE = False
         PENDING_ENTRY_SYMBOL = sym
         PENDING_ENTRY_FILL = True
 
-        data = _extract_data(resp)
+        data = _extract_data(response)
         avg_price = None
         if isinstance(data, dict):
             avg_price = _to_float(
@@ -536,7 +604,7 @@ def place_live_buy(sym):
 
         trade["qty"] = int(LOT_SIZE)
 
-        print(f"{GREEN}LIVE BUY ORDER PLACED : {sym} | {datetime.now().strftime('%H:%M:%S')}{RESET}")
+        print(f"{GREEN}[DHAN EXECUTION] LIVE BUY ORDER PLACED : {sym} | {datetime.now().strftime('%H:%M:%S')}{RESET}")
 
         msg = f"""LIVE BUY ORDER PLACED
         {sym}
@@ -619,21 +687,19 @@ def place_live_exit(sym):
             print("No trade quantity cached — exit skipped")
             return
 
-        # BROKER CHANGE: Dhan sell order
-        dhan.place_order(
-            security_id=str(ACTIVE_OPTION_TOKEN),
-            exchange_segment=EXCHANGE,
-            transaction_type="SELL",
-            quantity=int(qty),   # ✅ Use actual open quantity
-            order_type=ORDER_TYPE,
-            product_type=PRODUCT,
-            price=0,
-            validity="DAY"
-        )
+        dhan_sym = convert_to_dhan_symbol(sym)
+        response = dhan_place_order(dhan_sym, "SELL", qty)
+        print(f"[DHAN EXECUTION] DHAN EXIT ORDER: {response}")
+        if _is_dhan_order_failed(response):
+            print("[FALLBACK] Fallback to Zerodha")
+            response = _fallback_zerodha_order(sym, "SELL", qty)
+            if not response:
+                print("[FALLBACK] Zerodha exit also failed")
+                return
 
         EXIT_DONE = True
         OPEN_QTY_CACHE = {"symbol": sym, "qty": 0, "ts": time.time()}
-        print(f"{RED}LIVE EXIT ORDER : {sym}{RESET}")
+        print(f"{RED}[DHAN EXECUTION] LIVE EXIT ORDER : {sym}{RESET}")
 
     except Exception as e:
         print(f"EXIT ORDER ERROR : {e}")
