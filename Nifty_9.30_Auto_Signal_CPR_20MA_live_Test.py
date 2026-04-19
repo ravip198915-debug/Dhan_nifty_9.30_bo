@@ -23,13 +23,13 @@ import os
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
-import pandas as pd
 from colorama import init
 from dhanhq import dhanhq
 from dhanhq import marketfeed
+from openpyxl import Workbook, load_workbook
 
 
 # ========================== CONFIG ==========================
@@ -61,6 +61,8 @@ REST_FALLBACK_INTERVAL_SEC = 5
 MAX_RECONNECT_ATTEMPTS = 10
 TRADE_COOLDOWN_SEC = 10
 TRADE_LOG_FILE = "trade_log.xlsx"
+WATCHDOG_NO_TICK_SEC = 30
+HEARTBEAT_INTERVAL_SEC = 10
 
 # lock file
 LOCK_FILE = "trading.lock"
@@ -253,14 +255,89 @@ class BotState:
         self.last_option_log_ts = 0.0
         self.last_trade_time = 0.0
         self.reconnect_failures = 0
+        self.last_any_tick_ts = time.time()
+        self.last_heartbeat_ts = 0.0
 
         self.entry_time: Optional[datetime] = None
         self.exit_time: Optional[datetime] = None
         self.exit_reason: Optional[str] = None
         self.trade_logged = False
+        self.pending_trade_row: Optional[dict] = None
+        self.feed_client = None
+        self.feed_thread: Optional[threading.Thread] = None
 
 
 state = BotState()
+
+
+class TradeLogger:
+    HEADERS = [
+        "Date",
+        "Entry Time",
+        "Exit Time",
+        "Symbol",
+        "Side (CE/PE)",
+        "Entry Price",
+        "Exit Price",
+        "Quantity",
+        "P&L",
+        "Exit Reason (SL/TARGET/DAY CLOSE)",
+        "Trade Key",
+    ]
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.lock = threading.Lock()
+        self.logged_keys: Set[str] = set()
+        self._initialize()
+
+    def _initialize(self) -> None:
+        if not os.path.exists(self.file_path):
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Trades"
+            ws.append(self.HEADERS)
+            wb.save(self.file_path)
+            wb.close()
+            return
+
+        wb = load_workbook(self.file_path, read_only=True)
+        ws = wb.active
+        first_row = next(ws.iter_rows(min_row=1, max_row=1), None)
+        if first_row is None:
+            wb.close()
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Trades"
+            ws.append(self.HEADERS)
+            wb.save(self.file_path)
+            wb.close()
+            return
+        header_map = {str(cell.value): idx for idx, cell in enumerate(first_row, start=1)}
+        key_col = header_map.get("Trade Key")
+        if key_col:
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                key = row[key_col - 1] if key_col - 1 < len(row) else None
+                if key:
+                    self.logged_keys.add(str(key))
+        wb.close()
+
+    def append_trade(self, row: dict) -> bool:
+        trade_key = str(row["Trade Key"])
+        with self.lock:
+            if trade_key in self.logged_keys:
+                print(f"{YELLOW}[TRADE LOG SKIP] Duplicate trade key {trade_key}{RESET}")
+                return True
+            wb = load_workbook(self.file_path)
+            ws = wb.active
+            ws.append([row.get(h) for h in self.HEADERS])
+            wb.save(self.file_path)
+            wb.close()
+            self.logged_keys.add(trade_key)
+        return True
+
+
+trade_logger = TradeLogger(TRADE_LOG_FILE)
 
 
 # ========================== INSTRUMENTS ==========================
@@ -486,6 +563,7 @@ def log_trade_to_excel(
 ) -> None:
     trade_date = entry_time.date().isoformat()
     pnl = round((exit_price - entry_price) * quantity, 2)
+    trade_key = f"{symbol}|{side}|{entry_time.isoformat()}|{exit_time.isoformat()}"
     row = {
         "Date": trade_date,
         "Entry Time": entry_time.strftime("%H:%M:%S"),
@@ -497,12 +575,9 @@ def log_trade_to_excel(
         "Quantity": quantity,
         "P&L": pnl,
         "Exit Reason (SL/TARGET/DAY CLOSE)": reason,
+        "Trade Key": trade_key,
     }
-    new_df = pd.DataFrame([row])
-    if os.path.exists(TRADE_LOG_FILE):
-        existing_df = pd.read_excel(TRADE_LOG_FILE)
-        new_df = pd.concat([existing_df, new_df], ignore_index=True)
-    new_df.to_excel(TRADE_LOG_FILE, index=False, engine="openpyxl")
+    trade_logger.append_trade(row)
     print(f"{GREEN}[TRADE LOGGED] {TRADE_LOG_FILE} updated for {symbol}, P&L={pnl}{RESET}")
 
 
@@ -532,17 +607,19 @@ def place_exit(rest: DhanRestClient, reason: str) -> None:
     ):
         state.exit_time = datetime.now()
         state.exit_reason = reason
+        state.pending_trade_row = {
+            "symbol": state.active_symbol,
+            "side": state.active_side,
+            "entry_time": state.entry_time,
+            "exit_time": state.exit_time,
+            "entry_price": state.prem_entry,
+            "exit_price": state.option_ltp,
+            "quantity": LOT_SIZE,
+            "reason": reason,
+        }
         try:
-            log_trade_to_excel(
-                symbol=state.active_symbol,
-                side=state.active_side,
-                entry_time=state.entry_time,
-                exit_time=state.exit_time,
-                entry_price=state.prem_entry,
-                exit_price=state.option_ltp,
-                quantity=LOT_SIZE,
-                reason=reason,
-            )
+            log_trade_to_excel(**state.pending_trade_row)
+            state.pending_trade_row = None
             state.trade_logged = True
         except Exception as exc:
             print(f"{RED}[TRADE LOG ERROR] {exc}{RESET}")
@@ -574,12 +651,14 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
 
     if secid == SPOT_SECURITY_ID:
         state.spot_ltp = ltp
+        state.last_any_tick_ts = time.time()
         now_ts = time.time()
         if now_ts - state.last_spot_log_ts >= 2:
             state.last_spot_log_ts = now_ts
             print(f"{BLUE}[SPOT] NIFTY LTP={state.spot_ltp}{RESET}")
     elif state.active_security_id and secid == str(state.active_security_id):
         state.option_ltp = ltp
+        state.last_any_tick_ts = time.time()
         state.last_option_tick_ts = time.time()
         now_ts = time.time()
         if now_ts - state.last_option_log_ts >= 2:
@@ -631,6 +710,30 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
             place_exit(rest, "TARGET")
 
 
+def close_marketfeed_connection() -> None:
+    if state.feed_client is not None:
+        try:
+            state.feed_client.close()
+            print(f"{YELLOW}WebSocket connection closed cleanly.{RESET}")
+        except Exception as close_exc:
+            print(f"{YELLOW}WebSocket close warning: {close_exc}{RESET}")
+    if state.feed_thread is not None and state.feed_thread.is_alive():
+        state.feed_thread.join(timeout=2)
+    state.feed_client = None
+    state.feed_thread = None
+
+
+def flush_pending_trade_log() -> None:
+    if state.pending_trade_row and not state.trade_logged:
+        try:
+            log_trade_to_excel(**state.pending_trade_row)
+            state.pending_trade_row = None
+            state.trade_logged = True
+            print(f"{GREEN}[SHUTDOWN] Pending trade log flushed.{RESET}")
+        except Exception as exc:
+            print(f"{RED}[SHUTDOWN] Pending trade log flush failed: {exc}{RESET}")
+
+
 def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) -> None:
     reconnect_delay = RECONNECT_BASE_DELAY
     option_map: Dict[str, str] = {}
@@ -641,12 +744,11 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
         if state.active_security_id:
             instruments.append((marketfeed.NSE_FNO, str(state.active_security_id), marketfeed.Ticker))
 
-        data = None
-        ws_thread = None
         try:
-            data = marketfeed.DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments, "v2")
-            ws_thread = threading.Thread(target=data.run_forever, daemon=True)
-            ws_thread.start()
+            state.feed_client = marketfeed.DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments, "v2")
+            state.feed_thread = threading.Thread(target=state.feed_client.run_forever, daemon=True)
+            state.feed_thread.start()
+            state.last_any_tick_ts = time.time()
 
             empty_ticks = 0
             print(f"{GREEN}WebSocket connected with {len(instruments)} instrument(s){RESET}")
@@ -662,7 +764,19 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
                     state.feed_resubscribe_required = False
                     raise ConnectionError("Resubscribe required for newly selected option instrument")
 
-                response = data.get_data()
+                now_ts = time.time()
+                if now_ts - state.last_heartbeat_ts >= HEARTBEAT_INTERVAL_SEC:
+                    state.last_heartbeat_ts = now_ts
+                    print(f"{BLUE}Bot running... Spot LTP = {state.spot_ltp}{RESET}")
+
+                if now_ts - state.last_any_tick_ts >= WATCHDOG_NO_TICK_SEC:
+                    state.day_closed = True
+                    alert = f"[WATCHDOG] No tick received for {WATCHDOG_NO_TICK_SEC}s. Bot stopped for safety."
+                    print(f"{RED}{alert}{RESET}")
+                    send_telegram(alert)
+                    break
+
+                response = state.feed_client.get_data()
                 if not response:
                     empty_ticks += 1
                     if empty_ticks % EMPTY_TICK_LOG_EVERY == 0:
@@ -723,14 +837,7 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
             time.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
         finally:
-            if data is not None:
-                try:
-                    data.close()
-                    print(f"{YELLOW}WebSocket connection closed cleanly before reconnect.{RESET}")
-                except Exception as close_exc:
-                    print(f"{YELLOW}WebSocket close warning: {close_exc}{RESET}")
-            if ws_thread is not None and ws_thread.is_alive():
-                ws_thread.join(timeout=2)
+            close_marketfeed_connection()
 
 
 def main() -> None:
@@ -741,58 +848,70 @@ def main() -> None:
         print("Set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN environment variables.")
         return
 
-    print(f"{GREEN}MODE: OPTION BUYING SCRIPT - LIVE TRADE{RESET}")
-    print(f"{BLUE}Execution Date: {date.today()} | {datetime.now().strftime('%H:%M:%S')}{RESET}")
-    send_telegram("🚀 Script Started")
+    rest = None
+    try:
+        print(f"{GREEN}MODE: OPTION BUYING SCRIPT - LIVE TRADE{RESET}")
+        print(f"{BLUE}Execution Date: {date.today()} | {datetime.now().strftime('%H:%M:%S')}{RESET}")
+        send_telegram("🚀 Script Started")
 
-    # Init official client (kept for compatibility and future expansion)
-    _ = dhanhq(CLIENT_ID, ACCESS_TOKEN)
-    rest = DhanRestClient(CLIENT_ID, ACCESS_TOKEN)
+        # Init official client (kept for compatibility and future expansion)
+        _ = dhanhq(CLIENT_ID, ACCESS_TOKEN)
+        rest = DhanRestClient(CLIENT_ID, ACCESS_TOKEN)
 
-    print("Downloading instruments...")
-    instruments = download_nfo_master_with_retry()
-    if not instruments:
-        print("[FATAL] Instrument master unavailable after retry. Exiting.")
-        return
-    option_index, next_week_expiry = build_option_index(instruments)
-    if not next_week_expiry:
-        print("No valid NIFTY expiry found in instrument master.")
-        return
-    print(f"Loaded NFO instruments. Using expiry: {next_week_expiry}")
+        print("Downloading instruments...")
+        instruments = download_nfo_master_with_retry()
+        if not instruments:
+            print("[FATAL] Instrument master unavailable after retry. Exiting.")
+            return
+        option_index, next_week_expiry = build_option_index(instruments)
+        if not next_week_expiry:
+            print("No valid NIFTY expiry found in instrument master.")
+            return
+        print(f"Loaded NFO instruments. Using expiry: {next_week_expiry}")
 
-    # wait until 09:35 for completed 09:30 candle
-    while datetime.now().time() < dtime(9, 35):
-        print("Waiting for 9:35 to fetch 9:30 candle...")
-        time.sleep(5)
+        # wait until 09:35 for completed 09:30 candle
+        while datetime.now().time() < dtime(9, 35):
+            print("Waiting for 9:35 to fetch 9:30 candle...")
+            time.sleep(5)
 
-    state.candle = fetch_930_candle(rest)
-    if not state.candle:
-        print("Failed to fetch 9:30 candle. Exiting safely.")
-        return
+        state.candle = fetch_930_candle(rest)
+        if not state.candle:
+            print("Failed to fetch 9:30 candle. Exiting safely.")
+            return
 
-    print(f"{GREEN}Fetched 9:30 candle: High={state.candle.high}, Low={state.candle.low}{RESET}")
-    send_telegram("Fetched 9:30 candle successfully")
+        print(f"{GREEN}Fetched 9:30 candle: High={state.candle.high}, Low={state.candle.low}{RESET}")
+        send_telegram("Fetched 9:30 candle successfully")
 
-    # warm-up spot LTP
-    state.spot_ltp = rest.get_ltp(SPOT_SECURITY_ID, "IDX_I")
-    if rest.auth_failed:
-        print("[AUTH ERROR] Token invalid/expired. Exiting cleanly.")
-        send_telegram("[AUTH ERROR] Token invalid/expired. Bot stopped.")
+        # warm-up spot LTP
+        state.spot_ltp = rest.get_ltp(SPOT_SECURITY_ID, "IDX_I")
+        if rest.auth_failed:
+            print("[AUTH ERROR] Token invalid/expired. Exiting cleanly.")
+            send_telegram("[AUTH ERROR] Token invalid/expired. Bot stopped.")
+            state.day_closed = True
+            sys.exit(1)
+        if state.spot_ltp is None:
+            print("Spot LTP unavailable at startup; will continue with websocket updates.")
+
+        calculate_auto_signal(rest)
+
+        if not state.auto_ready:
+            print("Auto signal not ready due to missing data. Exiting.")
+            return
+
+        run_marketfeed_loop(rest, option_index, next_week_expiry)
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
         state.day_closed = True
-        sys.exit(1)
-    if state.spot_ltp is None:
-        print("Spot LTP unavailable at startup; will continue with websocket updates.")
-
-    calculate_auto_signal(rest)
-
-    if not state.auto_ready:
-        print("Auto signal not ready due to missing data. Exiting.")
-        return
-
-    run_marketfeed_loop(rest, option_index, next_week_expiry)
-
-    print("Script exited cleanly")
-    send_telegram("🛑 Script Stopped")
+    except Exception as exc:
+        state.day_closed = True
+        msg = f"[FATAL] Unexpected crash: {exc}"
+        print(f"{RED}{msg}{RESET}")
+        send_telegram(msg)
+    finally:
+        close_marketfeed_connection()
+        flush_pending_trade_log()
+        print("Script exited cleanly")
+        send_telegram("🛑 Script Stopped")
 
 
 if __name__ == "__main__":
