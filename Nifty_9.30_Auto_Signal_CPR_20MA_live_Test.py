@@ -12,7 +12,7 @@ DHAN_ACCESS_TOKEN = "YOUR_ACCESS_TOKEN"
 
 
 
-from dhanhq import DhanContext, dhanhq, MarketFeed
+from dhanhq import dhanhq, marketfeed
 from datetime import datetime, date, time as dtime, timedelta
 import time, threading, sys
 
@@ -131,9 +131,7 @@ candle={"high":None,"low":None}
 candle_done=False
 
 # ================= DHAN =================
-# BROKER CHANGE: Kite client replaced with Dhan client/context
-_dhan_context = DhanContext(CLIENT_ID, ACCESS_TOKEN)
-dhan = dhanhq(_dhan_context)
+dhan = dhanhq(CLIENT_ID, ACCESS_TOKEN)
 
 
 def _to_float(v):
@@ -723,8 +721,8 @@ class DhanTickerAdapter:
     def _to_feed_tuple(self, security_id):
         sid = str(security_id)
         if sid == str(SPOT_TOKEN):
-            return (MarketFeed.IDX, sid, MarketFeed.Ticker)
-        return (MarketFeed.NSE_FNO, sid, MarketFeed.Ticker)
+            return (marketfeed.IDX, sid, marketfeed.Ticker)
+        return (marketfeed.NSE_FNO, sid, marketfeed.Ticker)
 
     def subscribe(self, tokens):
         for t in tokens:
@@ -748,7 +746,7 @@ class DhanTickerAdapter:
                     continue
                 instruments = [self._to_feed_tuple(s) for s in sorted(self._subs)]
                 try:
-                    feed = MarketFeed(_dhan_context, instruments, "v2")
+                    feed = marketfeed.DhanFeed(self.client_id, self.access_token, instruments, "v2")
                     ws_thread = threading.Thread(target=feed.run_forever, daemon=True)
                     ws_thread.start()
                     last_tick_ts = time.time()
