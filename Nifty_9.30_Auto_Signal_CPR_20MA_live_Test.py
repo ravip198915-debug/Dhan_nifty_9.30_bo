@@ -26,6 +26,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import requests
+import pandas as pd
 from colorama import init
 from dhanhq import dhanhq
 from dhanhq import marketfeed
@@ -57,6 +58,9 @@ RECONNECT_MAX_DELAY = 30
 MAX_EMPTY_TICKS = 120
 EMPTY_TICK_LOG_EVERY = 20
 REST_FALLBACK_INTERVAL_SEC = 5
+MAX_RECONNECT_ATTEMPTS = 10
+TRADE_COOLDOWN_SEC = 10
+TRADE_LOG_FILE = "trade_log.xlsx"
 
 # lock file
 LOCK_FILE = "trading.lock"
@@ -247,6 +251,13 @@ class BotState:
         self.feed_resubscribe_required = False
         self.last_spot_log_ts = 0.0
         self.last_option_log_ts = 0.0
+        self.last_trade_time = 0.0
+        self.reconnect_failures = 0
+
+        self.entry_time: Optional[datetime] = None
+        self.exit_time: Optional[datetime] = None
+        self.exit_reason: Optional[str] = None
+        self.trade_logged = False
 
 
 state = BotState()
@@ -425,6 +436,13 @@ def should_enter(side: str) -> bool:
 
 
 def place_entry(rest: DhanRestClient, symbol: str, security_id: str, side: str) -> bool:
+    if time.time() - state.last_trade_time < TRADE_COOLDOWN_SEC:
+        print(
+            f"{YELLOW}[ENTRY BLOCKED] Cooldown active ({TRADE_COOLDOWN_SEC}s). "
+            f"Preventing duplicate trade trigger.{RESET}"
+        )
+        return False
+
     response = rest.place_order(security_id=security_id, side="BUY", qty=LOT_SIZE)
     if not response:
         print("[ENTRY FAILED] Empty order response")
@@ -440,14 +458,52 @@ def place_entry(rest: DhanRestClient, symbol: str, security_id: str, side: str) 
     state.trade_open = True
     state.order_placed = True
     state.feed_resubscribe_required = True
+    state.last_trade_time = time.time()
+    state.entry_time = datetime.now()
+    state.exit_time = None
+    state.exit_reason = None
+    state.trade_logged = False
 
     # if immediate option tick exists use it as entry reference
     if state.option_ltp is not None:
         state.prem_entry = state.option_ltp
     print(f"{GREEN}LIVE BUY ORDER PLACED: {symbol}{RESET}")
+    print(f"{BLUE}[ORDER RESPONSE][ENTRY] {response}{RESET}")
     print(f"{BLUE}[ENTRY] Side={side} | Spot={state.spot_ltp} | Option SID={security_id}{RESET}")
     send_telegram(f"LIVE BUY ORDER PLACED\n{symbol}\nTime: {datetime.now().strftime('%H:%M:%S')}")
     return True
+
+
+def log_trade_to_excel(
+    symbol: str,
+    side: str,
+    entry_time: datetime,
+    exit_time: datetime,
+    entry_price: float,
+    exit_price: float,
+    quantity: int,
+    reason: str,
+) -> None:
+    trade_date = entry_time.date().isoformat()
+    pnl = round((exit_price - entry_price) * quantity, 2)
+    row = {
+        "Date": trade_date,
+        "Entry Time": entry_time.strftime("%H:%M:%S"),
+        "Exit Time": exit_time.strftime("%H:%M:%S"),
+        "Symbol": symbol,
+        "Side (CE/PE)": side,
+        "Entry Price": round(entry_price, 2),
+        "Exit Price": round(exit_price, 2),
+        "Quantity": quantity,
+        "P&L": pnl,
+        "Exit Reason (SL/TARGET/DAY CLOSE)": reason,
+    }
+    new_df = pd.DataFrame([row])
+    if os.path.exists(TRADE_LOG_FILE):
+        existing_df = pd.read_excel(TRADE_LOG_FILE)
+        new_df = pd.concat([existing_df, new_df], ignore_index=True)
+    new_df.to_excel(TRADE_LOG_FILE, index=False, engine="openpyxl")
+    print(f"{GREEN}[TRADE LOGGED] {TRADE_LOG_FILE} updated for {symbol}, P&L={pnl}{RESET}")
 
 
 def place_exit(rest: DhanRestClient, reason: str) -> None:
@@ -464,7 +520,33 @@ def place_exit(rest: DhanRestClient, reason: str) -> None:
         print(f"{RED}[RISK] Stop-loss hit at option LTP={state.option_ltp}{RESET}")
     elif reason == "TARGET":
         print(f"{GREEN}[RISK] Target hit at option LTP={state.option_ltp}{RESET}")
+    print(f"{BLUE}[ORDER RESPONSE][EXIT] {response}{RESET}")
     send_telegram(f"EXIT TRADE\nSymbol: {state.active_symbol}\nReason: {reason}\nTime: {datetime.now().strftime('%H:%M:%S')}")
+
+    if (
+        not state.trade_logged
+        and state.entry_time
+        and state.prem_entry is not None
+        and state.option_ltp is not None
+        and state.active_side
+    ):
+        state.exit_time = datetime.now()
+        state.exit_reason = reason
+        try:
+            log_trade_to_excel(
+                symbol=state.active_symbol,
+                side=state.active_side,
+                entry_time=state.entry_time,
+                exit_time=state.exit_time,
+                entry_price=state.prem_entry,
+                exit_price=state.option_ltp,
+                quantity=LOT_SIZE,
+                reason=reason,
+            )
+            state.trade_logged = True
+        except Exception as exc:
+            print(f"{RED}[TRADE LOG ERROR] {exc}{RESET}")
+            send_telegram(f"Trade log write failed: {exc}")
 
     state.trade_open = False
     state.day_closed = True
@@ -520,11 +602,13 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
         if should_enter("CE") and state.allowed_side == "CE":
             sym, sid = get_atm_option(state.spot_ltp, "CE", option_index, expiry)
             if sym and sid:
+                print(f"{GREEN}[ENTRY TRIGGER] CE breakout @ spot {state.spot_ltp}{RESET}")
                 option_map[sid] = sym
                 place_entry(rest, sym, sid, "CE")
         elif should_enter("PE") and state.allowed_side == "PE":
             sym, sid = get_atm_option(state.spot_ltp, "PE", option_index, expiry)
             if sym and sid:
+                print(f"{GREEN}[ENTRY TRIGGER] PE breakdown @ spot {state.spot_ltp}{RESET}")
                 option_map[sid] = sym
                 place_entry(rest, sym, sid, "PE")
 
@@ -535,6 +619,7 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
             state.prem_sl = round(state.prem_entry - PREM_SL_PTS, 2)
             state.prem_target = round(state.prem_entry + PREM_TGT_PTS, 2)
             print(f"Premium Entry: {state.prem_entry} | Target: {state.prem_target} | SL: {state.prem_sl}")
+            print(f"{BLUE}[ORDER RESPONSE][ENTRY] Entry price reference captured from option ticks.{RESET}")
             send_telegram(
                 f"Premium Entry: {state.prem_entry}\nTarget: {state.prem_target}\nSL: {state.prem_sl}"
             )
@@ -556,6 +641,8 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
         if state.active_security_id:
             instruments.append((marketfeed.NSE_FNO, str(state.active_security_id), marketfeed.Ticker))
 
+        data = None
+        ws_thread = None
         try:
             data = marketfeed.DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments, "v2")
             ws_thread = threading.Thread(target=data.run_forever, daemon=True)
@@ -567,6 +654,7 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
             while not state.day_closed:
                 if rest.auth_failed:
                     print("[AUTH ERROR] Exiting due to invalid/expired token.")
+                    send_telegram("[AUTH ERROR] Access token expired/invalid. Bot stopping.")
                     state.day_closed = True
                     break
 
@@ -622,9 +710,27 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
         except Exception as exc:
             if state.day_closed:
                 break
-            print(f"{YELLOW}WebSocket error: {exc}. Reconnecting in {reconnect_delay}s...{RESET}")
+            state.reconnect_failures += 1
+            if state.reconnect_failures > MAX_RECONNECT_ATTEMPTS:
+                print(f"{RED}[FATAL] Max reconnect attempts exceeded. Stopping bot safely.{RESET}")
+                send_telegram("[FATAL] Max websocket reconnect attempts exceeded. Bot stopped.")
+                state.day_closed = True
+                break
+            print(
+                f"{YELLOW}WebSocket error: {exc}. Reconnecting in {reconnect_delay}s..."
+                f" (attempt {state.reconnect_failures}/{MAX_RECONNECT_ATTEMPTS}){RESET}"
+            )
             time.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+        finally:
+            if data is not None:
+                try:
+                    data.close()
+                    print(f"{YELLOW}WebSocket connection closed cleanly before reconnect.{RESET}")
+                except Exception as close_exc:
+                    print(f"{YELLOW}WebSocket close warning: {close_exc}{RESET}")
+            if ws_thread is not None and ws_thread.is_alive():
+                ws_thread.join(timeout=2)
 
 
 def main() -> None:
@@ -670,8 +776,10 @@ def main() -> None:
     # warm-up spot LTP
     state.spot_ltp = rest.get_ltp(SPOT_SECURITY_ID, "IDX_I")
     if rest.auth_failed:
-        print("[AUTH ERROR] Token invalid. Exiting cleanly.")
-        return
+        print("[AUTH ERROR] Token invalid/expired. Exiting cleanly.")
+        send_telegram("[AUTH ERROR] Token invalid/expired. Bot stopped.")
+        state.day_closed = True
+        sys.exit(1)
     if state.spot_ltp is None:
         print("Spot LTP unavailable at startup; will continue with websocket updates.")
 
