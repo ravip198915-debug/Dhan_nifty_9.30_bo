@@ -21,6 +21,7 @@ from datetime import date, datetime, time as dtime, timedelta
 import atexit
 import os
 import sys
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -54,6 +55,8 @@ CPR_WIDE_THRESHOLD = 0.6
 RECONNECT_BASE_DELAY = 3
 RECONNECT_MAX_DELAY = 30
 MAX_EMPTY_TICKS = 120
+EMPTY_TICK_LOG_EVERY = 20
+REST_FALLBACK_INTERVAL_SEC = 5
 
 # lock file
 LOCK_FILE = "trading.lock"
@@ -120,6 +123,7 @@ class DhanRestClient:
             "access-token": access_token,
             "Content-Type": "application/json",
         }
+        self.auth_failed = False
 
     def _request(self, method: str, path: str, payload: Optional[dict] = None) -> Optional[dict]:
         try:
@@ -128,6 +132,7 @@ class DhanRestClient:
 
             if resp.status_code == 401:
                 print("[AUTH ERROR] Access token expired/invalid.")
+                self.auth_failed = True
                 return None
 
             resp.raise_for_status()
@@ -239,6 +244,9 @@ class BotState:
         self.prem_target: Optional[float] = None
 
         self.last_option_tick_ts = 0.0
+        self.feed_resubscribe_required = False
+        self.last_spot_log_ts = 0.0
+        self.last_option_log_ts = 0.0
 
 
 state = BotState()
@@ -274,6 +282,15 @@ def download_nfo_master() -> List[dict]:
     except Exception as exc:
         print(f"Instrument download error: {exc}")
     return rows
+
+
+def download_nfo_master_with_retry() -> List[dict]:
+    rows = download_nfo_master()
+    if rows:
+        return rows
+    print(f"{YELLOW}Instrument download failed/empty. Retrying once...{RESET}")
+    time.sleep(1)
+    return download_nfo_master()
 
 
 def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, str], dict], Optional[date]]:
@@ -422,11 +439,13 @@ def place_entry(rest: DhanRestClient, symbol: str, security_id: str, side: str) 
     state.active_side = side
     state.trade_open = True
     state.order_placed = True
+    state.feed_resubscribe_required = True
 
     # if immediate option tick exists use it as entry reference
     if state.option_ltp is not None:
         state.prem_entry = state.option_ltp
     print(f"{GREEN}LIVE BUY ORDER PLACED: {symbol}{RESET}")
+    print(f"{BLUE}[ENTRY] Side={side} | Spot={state.spot_ltp} | Option SID={security_id}{RESET}")
     send_telegram(f"LIVE BUY ORDER PLACED\n{symbol}\nTime: {datetime.now().strftime('%H:%M:%S')}")
     return True
 
@@ -441,10 +460,26 @@ def place_exit(rest: DhanRestClient, reason: str) -> None:
         return
 
     print(f"{RED}EXIT ORDER PLACED: {state.active_symbol} | Reason: {reason}{RESET}")
+    if reason == "SL":
+        print(f"{RED}[RISK] Stop-loss hit at option LTP={state.option_ltp}{RESET}")
+    elif reason == "TARGET":
+        print(f"{GREEN}[RISK] Target hit at option LTP={state.option_ltp}{RESET}")
     send_telegram(f"EXIT TRADE\nSymbol: {state.active_symbol}\nReason: {reason}\nTime: {datetime.now().strftime('%H:%M:%S')}")
 
     state.trade_open = False
     state.day_closed = True
+
+
+def _extract_ticks(response: dict) -> List[dict]:
+    if not isinstance(response, dict):
+        return []
+    if isinstance(response.get("data"), list):
+        return [x for x in response["data"] if isinstance(x, dict)]
+    if isinstance(response.get("ticks"), list):
+        return [x for x in response["ticks"] if isinstance(x, dict)]
+    if response.get("security_id") or response.get("securityId"):
+        return [response]
+    return []
 
 
 def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], option_index: dict, expiry: date) -> None:
@@ -457,9 +492,17 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
 
     if secid == SPOT_SECURITY_ID:
         state.spot_ltp = ltp
+        now_ts = time.time()
+        if now_ts - state.last_spot_log_ts >= 2:
+            state.last_spot_log_ts = now_ts
+            print(f"{BLUE}[SPOT] NIFTY LTP={state.spot_ltp}{RESET}")
     elif state.active_security_id and secid == str(state.active_security_id):
         state.option_ltp = ltp
         state.last_option_tick_ts = time.time()
+        now_ts = time.time()
+        if now_ts - state.last_option_log_ts >= 2:
+            state.last_option_log_ts = now_ts
+            print(f"{YELLOW}[OPTION] {state.active_symbol or state.active_security_id} LTP={state.option_ltp}{RESET}")
 
     # Forced day close
     if now >= FORCE_EXIT_TIME and not state.day_closed:
@@ -509,21 +552,56 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
 
     while not state.day_closed:
         # instrument format required by Dhan marketfeed v2
-        instruments = [(marketfeed.NSE, SPOT_SECURITY_ID, marketfeed.Ticker)]
+        instruments = [(marketfeed.NSE, str(SPOT_SECURITY_ID), marketfeed.Ticker)]
         if state.active_security_id:
             instruments.append((marketfeed.NSE_FNO, str(state.active_security_id), marketfeed.Ticker))
 
         try:
             data = marketfeed.DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments, "v2")
-            data.run_forever()
+            ws_thread = threading.Thread(target=data.run_forever, daemon=True)
+            ws_thread.start()
 
             empty_ticks = 0
             print(f"{GREEN}WebSocket connected with {len(instruments)} instrument(s){RESET}")
 
             while not state.day_closed:
+                if rest.auth_failed:
+                    print("[AUTH ERROR] Exiting due to invalid/expired token.")
+                    state.day_closed = True
+                    break
+
+                if state.feed_resubscribe_required:
+                    state.feed_resubscribe_required = False
+                    raise ConnectionError("Resubscribe required for newly selected option instrument")
+
                 response = data.get_data()
                 if not response:
                     empty_ticks += 1
+                    if empty_ticks % EMPTY_TICK_LOG_EVERY == 0:
+                        print(f"{YELLOW}No tick data ({empty_ticks} empty reads).{RESET}")
+
+                    # REST fallback while websocket is quiet
+                    if empty_ticks % int(max(1, REST_FALLBACK_INTERVAL_SEC / 0.25)) == 0:
+                        spot_ltp = rest.get_ltp(SPOT_SECURITY_ID, "IDX_I")
+                        if spot_ltp is not None:
+                            handle_tick(
+                                rest,
+                                {"security_id": str(SPOT_SECURITY_ID), "ltp": spot_ltp},
+                                option_map,
+                                option_index,
+                                expiry,
+                            )
+                        if state.active_security_id:
+                            opt_ltp = rest.get_ltp(str(state.active_security_id), "NSE_FNO")
+                            if opt_ltp is not None:
+                                handle_tick(
+                                    rest,
+                                    {"security_id": str(state.active_security_id), "ltp": opt_ltp},
+                                    option_map,
+                                    option_index,
+                                    expiry,
+                                )
+
                     if empty_ticks > MAX_EMPTY_TICKS:
                         raise ConnectionError("No marketfeed data for extended duration")
                     time.sleep(0.25)
@@ -531,7 +609,11 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
 
                 empty_ticks = 0
                 reconnect_delay = RECONNECT_BASE_DELAY
-                handle_tick(rest, response, option_map, option_index, expiry)
+                ticks = _extract_ticks(response)
+                if not ticks:
+                    continue
+                for tick in ticks:
+                    handle_tick(rest, tick, option_map, option_index, expiry)
 
         except KeyboardInterrupt:
             state.day_closed = True
@@ -562,7 +644,10 @@ def main() -> None:
     rest = DhanRestClient(CLIENT_ID, ACCESS_TOKEN)
 
     print("Downloading instruments...")
-    instruments = download_nfo_master()
+    instruments = download_nfo_master_with_retry()
+    if not instruments:
+        print("[FATAL] Instrument master unavailable after retry. Exiting.")
+        return
     option_index, next_week_expiry = build_option_index(instruments)
     if not next_week_expiry:
         print("No valid NIFTY expiry found in instrument master.")
@@ -584,6 +669,9 @@ def main() -> None:
 
     # warm-up spot LTP
     state.spot_ltp = rest.get_ltp(SPOT_SECURITY_ID, "IDX_I")
+    if rest.auth_failed:
+        print("[AUTH ERROR] Token invalid. Exiting cleanly.")
+        return
     if state.spot_ltp is None:
         print("Spot LTP unavailable at startup; will continue with websocket updates.")
 
