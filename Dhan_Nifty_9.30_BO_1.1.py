@@ -362,31 +362,22 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
     expiries = set()
 
     for ins in instruments:
-        # ✅ FIX: define symbol first
         symbol = str(ins.get("SEM_CUSTOM_SYMBOL", "")).upper()
 
-        # ✅ filter only NIFTY
-        if "NIFTY" not in symbol:
+        if not symbol.startswith("NIFTY"):
             continue
 
-        # ✅ expiry parsing
-        
-        expiry_raw = str(
-            ins.get("SEM_EXPIRY_DATE")
-            or ins.get("SEM_EXPIRY_CODE")
-            or ins.get("EXPIRY")
-            or ""
-        ).strip()
-        if not expiry_raw or expiry_raw in ["0", ""]:
-            expiry_raw = str(ins.get("SEM_EXPIRY_CODE", "")).strip()
+        expiry_raw = str(ins.get("SEM_EXPIRY_DATE", "")).strip()
+        if not expiry_raw or expiry_raw == "0":
+            continue
 
+        print("RAW EXPIRY:", expiry_raw)
         expiry = _parse_expiry(expiry_raw)
 
-        if not expiry: 
+        if not expiry:
             print("FAILED EXPIRY RAW:", expiry_raw)
             continue
 
-        # ✅ option type fix
         opt_raw = str(ins.get("SEM_OPTION_TYPE", "")).upper()
         if "CE" in opt_raw or "CALL" in opt_raw:
             opt_type = "CE"
@@ -395,13 +386,11 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
         else:
             continue
 
-        # ✅ strike parsing
         try:
             strike = int(float(ins.get("SEM_STRIKE_PRICE", "0")))
         except Exception:
             continue
 
-        # ✅ store option
         option_index[(expiry, strike, opt_type)] = {
             "symbol": ins.get("SEM_TRADING_SYMBOL"),
             "security_id": ins.get("SEM_SMST_SECURITY_ID"),
@@ -409,9 +398,9 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
 
         expiries.add(expiry)
 
-    # ✅ sort expiries and select next week purely from available master data
     sorted_exp = sorted(expiries)
     today = date.today()
+
     future_exp = [d for d in sorted_exp if d >= today]
 
     if len(future_exp) >= 2:
@@ -421,12 +410,12 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
     else:
         selected_expiry = None
 
+    if selected_expiry is None:
+        print("Fallback: using last available expiry")
+        selected_expiry = sorted_exp[-1] if sorted_exp else None
+
     print("Available expiries:", sorted_exp[:10])
     print("Selected expiry:", selected_expiry)
-
-    if selected_expiry is None:
-        print("No expiry found — using nearest available")
-        selected_expiry = sorted_exp[-1] if sorted_exp else None
 
     return option_index, selected_expiry
 
