@@ -405,11 +405,10 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
 
         expiries.add(expiry)
 
-    if len(expiries) < 2:
-        raise Exception("Insufficient expiry data — check instrument CSV")
-
     if not expiries:
         raise Exception("No valid expiries found — check instrument file")
+
+    print(f"Total valid expiries found: {len(expiries)}")
 
     sorted_exp = sorted(expiries)
     today = date.today()
@@ -419,11 +418,9 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
     if len(future_exp) >= 2:
         selected_expiry = future_exp[1]
     elif len(future_exp) == 1:
+        print("Only one expiry available — using it")
         selected_expiry = future_exp[0]
     else:
-        selected_expiry = None
-
-    if selected_expiry is None:
         print("Fallback: using last available expiry")
         selected_expiry = sorted_exp[-1] if sorted_exp else None
 
