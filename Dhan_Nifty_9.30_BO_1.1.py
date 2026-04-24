@@ -17,7 +17,7 @@ Notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime
 import atexit
 import os
 import sys
@@ -178,19 +178,6 @@ class DhanRestClient:
                 if isinstance(row, dict):
                     return _to_float(row.get("last_price") or row.get("LTP") or row.get("ltp"))
         return None
-
-    def historical_daily(self, security_id: str, from_date: date, to_date: date) -> List[dict]:
-        payload = {
-            "securityId": str(security_id),
-            "exchangeSegment": "IDX_I",
-            "instrument": "INDEX",
-            "fromDate": from_date.strftime("%Y-%m-%d"),
-            "toDate": to_date.strftime("%Y-%m-%d"),
-        }
-        raw = self._request("POST", "/charts/historical", payload)
-        if not raw:
-            return []
-        return raw.get("data", []) if isinstance(raw.get("data", []), list) else []
 
     def place_order(self, security_id: str, side: str, qty: int) -> Optional[dict]:
         payload = {
@@ -469,51 +456,13 @@ def get_atm_option(spot: float, side: str, option_index: dict, expiry: date) -> 
 
 # ========================== STRATEGY LOGIC ==========================
 def calculate_auto_signal(rest: DhanRestClient) -> None:
-    today = date.today()
-    candles = rest.historical_daily(SPOT_SECURITY_ID, today - timedelta(days=60), today)
-
-    if len(candles) < 22:
-        print("Not enough daily candles — skipping AUTO SIGNAL")
-        return
-
-    prev = candles[-2]
-    pdh = _to_float(prev.get("high") or prev.get("High"))
-    pdl = _to_float(prev.get("low") or prev.get("Low"))
-    pdc = _to_float(prev.get("close") or prev.get("Close"))
-
-    if pdh is None or pdl is None or pdc is None:
-        print("Invalid previous-day OHLC data")
-        return
-
-    pivot = (pdh + pdl + pdc) / 3
-    bc = (pdh + pdl) / 2
-    tc = (pivot - bc) + pivot
-
-    cpr_width = abs(tc - bc) / pivot * 100
-    state.cpr_type = "WIDE" if cpr_width >= CPR_WIDE_THRESHOLD else ("NARROW" if cpr_width <= 0.15 else "NORMAL")
-
-    closes = [_to_float(x.get("close") or x.get("Close")) for x in candles[:-1]]
-    closes = [x for x in closes if x is not None]
-    if len(closes) < 20:
-        print("Not enough closes for MA20")
-        return
-    ma20 = sum(closes[-20:]) / 20
-
-    state.ma_side = "Above" if pdc > ma20 else "Below"
-
-    if state.cpr_type != "WIDE":
-        if state.ma_side == "Above":
-            state.auto_signal = "CE BUY DAY"
-            state.allowed_side = "CE"
-        else:
-            state.auto_signal = "PE BUY DAY"
-            state.allowed_side = "PE"
-    else:
-        state.auto_signal = "NO TRADE"
-        state.allowed_side = "PE" if state.ma_side == "Above" else "CE"
-
+    print("[AUTO SIGNAL] Using fallback logic (NO historical API)")
+    state.allowed_side = "CE"
+    state.auto_signal = "MANUAL MODE"
+    state.cpr_type = "NORMAL"
+    state.ma_side = "N/A"
     state.auto_ready = True
-    msg = f"[AUTO SIGNAL] CPR={state.cpr_type} | 20MA={state.ma_side} | SIGNAL={state.auto_signal} | Allowed={state.allowed_side}"
+    msg = f"[AUTO SIGNAL] SIGNAL={state.auto_signal} | Allowed={state.allowed_side}"
     print(msg)
     send_telegram(msg)
 
@@ -904,10 +853,6 @@ def main() -> None:
         print("Skipping REST LTP — using WebSocket only")
 
         calculate_auto_signal(rest)
-
-        if not state.auto_ready:
-            print("Auto signal not ready due to missing data. Exiting.")
-            return
 
         run_marketfeed_loop(rest, option_index, next_week_expiry)
     except KeyboardInterrupt:
