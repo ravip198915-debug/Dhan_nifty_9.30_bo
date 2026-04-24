@@ -409,20 +409,26 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
 
         expiries.add(expiry)
 
-    # ✅ sort expiries
+    # ✅ sort expiries and select next week purely from available master data
     sorted_exp = sorted(expiries)
     today = date.today()
+    future_exp = [d for d in sorted_exp if d >= today]
 
-    # ✅ weekly (Thursday) expiries only; pick strictly next weekly after current
-    future_exp = [d for d in sorted_exp if d >= today and d.weekday() == 3]
     if len(future_exp) >= 2:
-        next_week = future_exp[1]
+        selected_expiry = future_exp[1]
     elif len(future_exp) == 1:
-        next_week = future_exp[0]
+        selected_expiry = future_exp[0]
     else:
-        next_week = None
+        selected_expiry = None
 
-    return option_index, next_week
+    print("Available expiries:", sorted_exp[:10])
+    print("Selected expiry:", selected_expiry)
+
+    if selected_expiry is None:
+        print("No expiry found — using nearest available")
+        selected_expiry = sorted_exp[-1] if sorted_exp else None
+
+    return option_index, selected_expiry
 
 
 def get_atm_option(spot: float, side: str, option_index: dict, expiry: date) -> Tuple[Optional[str], Optional[str]]:
