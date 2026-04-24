@@ -436,8 +436,8 @@ def get_atm_option(spot: float, side: str, option_index: dict, expiry: date) -> 
     return None, None
 
 # ========================== STRATEGY LOGIC ==========================
-def calculate_auto_signal(rest: DhanRestClient) -> None:
-    print("[AUTO SIGNAL DISABLED — using fallback]")
+def calculate_auto_signal() -> None:
+    print("[AUTO SIGNAL] Using fallback logic (no REST)")
     state.allowed_side = "CE"
     state.auto_signal = "MANUAL"
     state.cpr_type = "NORMAL"
@@ -649,6 +649,9 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
     if state.day_closed or now >= LAST_ENTRY_TIME:
         return
 
+    if state.spot_ltp is None:
+        return
+
     # Entry logic (one trade/day)
     if (
         not state.trade_open
@@ -660,8 +663,6 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
         and not state.skip_trading_today
         and now >= first_entry_time
     ):
-        if state.spot_ltp is None:
-            return
         if not state.allowed_side:
             return
 
@@ -741,12 +742,6 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
             print(f"{GREEN}WebSocket connected with {len(instruments)} instrument(s){RESET}")
 
             while not state.day_closed:
-                if rest.auth_failed:
-                    print("[AUTH ERROR] Exiting due to invalid/expired token.")
-                    send_telegram("[AUTH ERROR] Access token expired/invalid. Bot stopping.")
-                    state.day_closed = True
-                    break
-
                 if state.feed_resubscribe_required:
                     state.feed_resubscribe_required = False
                     raise ConnectionError("Resubscribe required for newly selected option instrument")
@@ -836,7 +831,7 @@ def main() -> None:
 
         print("Using WebSocket for LTP only")
 
-        calculate_auto_signal(rest)
+        calculate_auto_signal()
 
         run_marketfeed_loop(rest, option_index, next_week_expiry)
     except KeyboardInterrupt:
