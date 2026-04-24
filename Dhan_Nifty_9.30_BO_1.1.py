@@ -442,9 +442,10 @@ def get_atm_option(spot: float, side: str, option_index: dict, expiry: date) -> 
 
 # ========================== STRATEGY LOGIC ==========================
 def calculate_auto_signal():
-    print("[AUTO SIGNAL] Using fallback logic (no REST)")
-    state.allowed_side = "CE"
-    state.auto_signal = "MANUAL"
+    print("[AUTO SIGNAL] Dynamic breakout-side mode enabled")
+    # Side is decided at entry time from breakout direction (no hardcoded CE/PE bias).
+    state.allowed_side = None
+    state.auto_signal = "BREAKOUT_DYNAMIC"
     state.cpr_type = "NORMAL"
     state.ma_side = "N/A"
     state.auto_ready = True
@@ -668,16 +669,18 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
         and not state.skip_trading_today
         and now >= first_entry_time
     ):
-        if not state.allowed_side:
-            return
-
-        if should_enter("CE") and state.allowed_side == "CE":
+        # Dynamic direction selection by breakout side:
+        # - Break above 9:35 high => CE
+        # - Break below 9:35 low  => PE
+        if should_enter("CE"):
+            state.allowed_side = "CE"
             sym, sid = get_atm_option(state.spot_ltp, "CE", option_index, expiry)
             if sym and sid:
                 print(f"{GREEN}[ENTRY TRIGGER] CE breakout @ spot {state.spot_ltp}{RESET}")
                 option_map[sid] = sym
                 place_entry(rest, sym, sid, "CE")
-        elif should_enter("PE") and state.allowed_side == "PE":
+        elif should_enter("PE"):
+            state.allowed_side = "PE"
             sym, sid = get_atm_option(state.spot_ltp, "PE", option_index, expiry)
             if sym and sid:
                 print(f"{GREEN}[ENTRY TRIGGER] PE breakdown @ spot {state.spot_ltp}{RESET}")
