@@ -61,7 +61,7 @@ REST_FALLBACK_INTERVAL_SEC = 5
 MAX_RECONNECT_ATTEMPTS = 10
 TRADE_COOLDOWN_SEC = 10
 TRADE_LOG_FILE = "trade_log.xlsx"
-WATCHDOG_NO_TICK_SEC = 30
+WATCHDOG_NO_TICK_SEC = 10
 HEARTBEAT_INTERVAL_SEC = 10
 
 # lock file
@@ -217,6 +217,7 @@ class BotState:
         self.candle_low: Optional[float] = None
         self.candle_ready = False
         self.skip_trading_today = False
+        self.trade_closed = False
 
         self.active_symbol: Optional[str] = None
         self.active_security_id: Optional[str] = None
@@ -234,6 +235,9 @@ class BotState:
         self.reconnect_failures = 0
         self.last_any_tick_ts = time.time()
         self.last_heartbeat_ts = 0.0
+        self.last_no_tick_warning_ts = 0.0
+        self.bot_start_dt = datetime.now()
+        self.late_start_checked = False
 
         self.entry_time: Optional[datetime] = None
         self.exit_time: Optional[datetime] = None
@@ -436,10 +440,16 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
 
     # ✅ sort expiries
     sorted_exp = sorted(expiries)
-
-    # ✅ pick nearest weekly expiry
     today = date.today()
-    next_week = min([d for d in sorted_exp if d >= today], default=None)
+
+    # ✅ weekly (Thursday) expiries only; pick strictly next weekly after current
+    future_exp = [d for d in sorted_exp if d >= today and d.weekday() == 3]
+    if len(future_exp) >= 2:
+        next_week = future_exp[1]
+    elif len(future_exp) == 1:
+        next_week = future_exp[0]
+    else:
+        next_week = None
 
     return option_index, next_week
 
@@ -472,8 +482,8 @@ def should_enter(side: str) -> bool:
         return False
 
     if side == "CE":
-        return state.spot_ltp >= state.candle.high + 1
-    return state.spot_ltp <= state.candle.low - 1
+        return state.spot_ltp >= state.candle.high + 2
+    return state.spot_ltp <= state.candle.low - 2
 
 
 def place_entry(rest: DhanRestClient, symbol: str, security_id: str, side: str) -> bool:
@@ -589,7 +599,16 @@ def place_exit(rest: DhanRestClient, reason: str) -> None:
             print(f"{RED}[TRADE LOG ERROR] {exc}{RESET}")
             send_telegram(f"Trade log write failed: {exc}")
 
+    if state.prem_entry is not None and state.option_ltp is not None:
+        pnl = round((state.option_ltp - state.prem_entry) * LOT_SIZE, 2)
+        print("TRADE SUMMARY:")
+        print(f"Entry Price: {round(state.prem_entry, 2)}")
+        print(f"Exit Price: {round(state.option_ltp, 2)}")
+        print(f"P&L: {pnl}")
+        print(f"Reason: {reason}")
+
     state.trade_open = False
+    state.trade_closed = True
     state.day_closed = True
 
 
@@ -609,6 +628,14 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
     now = datetime.now().time()
     candle_start = dtime(9, 30)
     candle_end = dtime(9, 35)
+    first_entry_time = dtime(9, 36)
+
+    if not state.late_start_checked:
+        state.late_start_checked = True
+        if state.bot_start_dt.time() > candle_end:
+            state.skip_trading_today = True
+            print(f"{YELLOW}[NO TRADE] Bot started after 09:35. Skipping day by rule.{RESET}")
+            send_telegram("[NO TRADE] Bot started after 09:35. Trading skipped for the day.")
 
     secid = str(tick.get("security_id") or tick.get("securityId") or "")
     ltp = _to_float(tick.get("LTP") or tick.get("last_price") or tick.get("ltp"))
@@ -658,10 +685,12 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
     if (
         not state.trade_open
         and not state.order_placed
+        and not state.trade_closed
         and state.auto_ready
         and state.cpr_type != "WIDE"
         and state.candle_ready
         and not state.skip_trading_today
+        and now >= first_entry_time
     ):
         if state.spot_ltp is None:
             return
@@ -671,12 +700,20 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
         if should_enter("CE") and state.allowed_side == "CE":
             sym, sid = get_atm_option(state.spot_ltp, "CE", option_index, expiry)
             if sym and sid:
+                option_ltp_check = rest.get_ltp(str(sid), "NSE_FNO")
+                if option_ltp_check is None or option_ltp_check < 10:
+                    print(f"{YELLOW}[ENTRY SKIPPED] CE option illiquid (LTP={option_ltp_check}).{RESET}")
+                    return
                 print(f"{GREEN}[ENTRY TRIGGER] CE breakout @ spot {state.spot_ltp}{RESET}")
                 option_map[sid] = sym
                 place_entry(rest, sym, sid, "CE")
         elif should_enter("PE") and state.allowed_side == "PE":
             sym, sid = get_atm_option(state.spot_ltp, "PE", option_index, expiry)
             if sym and sid:
+                option_ltp_check = rest.get_ltp(str(sid), "NSE_FNO")
+                if option_ltp_check is None or option_ltp_check < 10:
+                    print(f"{YELLOW}[ENTRY SKIPPED] PE option illiquid (LTP={option_ltp_check}).{RESET}")
+                    return
                 print(f"{GREEN}[ENTRY TRIGGER] PE breakdown @ spot {state.spot_ltp}{RESET}")
                 option_map[sid] = sym
                 place_entry(rest, sym, sid, "PE")
@@ -760,11 +797,11 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
                     print(f"{BLUE}Bot running... Spot LTP = {state.spot_ltp}{RESET}")
 
                 if now_ts - state.last_any_tick_ts >= WATCHDOG_NO_TICK_SEC:
-                    state.day_closed = True
-                    alert = f"[WATCHDOG] No tick received for {WATCHDOG_NO_TICK_SEC}s. Bot stopped for safety."
-                    print(f"{RED}{alert}{RESET}")
-                    send_telegram(alert)
-                    break
+                    if now_ts - state.last_no_tick_warning_ts >= WATCHDOG_NO_TICK_SEC:
+                        state.last_no_tick_warning_ts = now_ts
+                        alert = "[WARNING] No live ticks"
+                        print(f"{YELLOW}{alert}{RESET}")
+                        send_telegram(alert)
 
                 response = state.feed_client.get_data()
                 if not response:
