@@ -714,6 +714,8 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
         and state.candle_ready
         and not state.skip_trading_today
     ):
+        if state.spot_ltp is None:
+            return
         if not state.allowed_side:
             return
 
@@ -823,15 +825,6 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
 
                     # REST fallback while websocket is quiet
                     if empty_ticks % int(max(1, REST_FALLBACK_INTERVAL_SEC / 0.25)) == 0:
-                        spot_ltp = rest.get_ltp(SPOT_SECURITY_ID, "IDX_I")
-                        if spot_ltp is not None:
-                            handle_tick(
-                                rest,
-                                {"security_id": str(SPOT_SECURITY_ID), "ltp": spot_ltp},
-                                option_map,
-                                option_index,
-                                expiry,
-                            )
                         if state.active_security_id:
                             opt_ltp = rest.get_ltp(str(state.active_security_id), "NSE_FNO")
                             if opt_ltp is not None:
@@ -908,15 +901,7 @@ def main() -> None:
             return
         print(f"Loaded NFO instruments. Using expiry: {next_week_expiry}")
 
-        # warm-up spot LTP
-        state.spot_ltp = rest.get_ltp(SPOT_SECURITY_ID, "IDX_I")
-        if rest.auth_failed:
-            print("[AUTH ERROR] Token invalid/expired. Exiting cleanly.")
-            send_telegram("[AUTH ERROR] Token invalid/expired. Bot stopped.")
-            state.day_closed = True
-            sys.exit(1)
-        if state.spot_ltp is None:
-            print("Spot LTP unavailable at startup; will continue with websocket updates.")
+        print("Skipping REST LTP — using WebSocket only")
 
         calculate_auto_signal(rest)
 
