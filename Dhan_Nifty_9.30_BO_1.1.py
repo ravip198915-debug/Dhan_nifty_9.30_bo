@@ -57,7 +57,6 @@ RECONNECT_BASE_DELAY = 3
 RECONNECT_MAX_DELAY = 30
 MAX_EMPTY_TICKS = 120
 EMPTY_TICK_LOG_EVERY = 20
-REST_FALLBACK_INTERVAL_SEC = 5
 MAX_RECONNECT_ATTEMPTS = 10
 TRADE_COOLDOWN_SEC = 10
 TRADE_LOG_FILE = "trade_log.xlsx"
@@ -150,34 +149,6 @@ class DhanRestClient:
         except Exception as exc:
             print(f"[REST ERROR] {path}: {exc}")
             return None
-
-    def get_ltp(self, security_id: str, exchange_segment: str) -> Optional[float]:
-        payload = {
-            "NSE_EQ": [],
-            "NSE_FNO": [],
-            "NSE_CURRENCY": [],
-            "BSE_EQ": [],
-            "MCX_COMM": [],
-            "IDX_I": [],
-        }
-        if exchange_segment == "IDX_I":
-            payload["IDX_I"] = [str(security_id)]
-        elif exchange_segment == "NSE_FNO":
-            payload["NSE_FNO"] = [str(security_id)]
-        else:
-            payload["NSE_EQ"] = [str(security_id)]
-
-        raw = self._request("POST", "/marketfeed/ltp", payload)
-        if not raw:
-            return None
-
-        # Dhan returns nested map keyed by segment->security_id
-        for segment_map in raw.values():
-            if isinstance(segment_map, dict):
-                row = segment_map.get(str(security_id))
-                if isinstance(row, dict):
-                    return _to_float(row.get("last_price") or row.get("LTP") or row.get("ltp"))
-        return None
 
     def place_order(self, security_id: str, side: str, qty: int) -> Optional[dict]:
         payload = {
@@ -466,15 +437,12 @@ def get_atm_option(spot: float, side: str, option_index: dict, expiry: date) -> 
 
 # ========================== STRATEGY LOGIC ==========================
 def calculate_auto_signal(rest: DhanRestClient) -> None:
-    print("[AUTO SIGNAL] Using fallback logic (NO historical API)")
+    print("[AUTO SIGNAL DISABLED — using fallback]")
     state.allowed_side = "CE"
-    state.auto_signal = "MANUAL MODE"
+    state.auto_signal = "MANUAL"
     state.cpr_type = "NORMAL"
     state.ma_side = "N/A"
     state.auto_ready = True
-    msg = f"[AUTO SIGNAL] SIGNAL={state.auto_signal} | Allowed={state.allowed_side}"
-    print(msg)
-    send_telegram(msg)
 
 
 def should_enter(side: str) -> bool:
@@ -700,20 +668,12 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
         if should_enter("CE") and state.allowed_side == "CE":
             sym, sid = get_atm_option(state.spot_ltp, "CE", option_index, expiry)
             if sym and sid:
-                option_ltp_check = rest.get_ltp(str(sid), "NSE_FNO")
-                if option_ltp_check is None or option_ltp_check < 10:
-                    print(f"{YELLOW}[ENTRY SKIPPED] CE option illiquid (LTP={option_ltp_check}).{RESET}")
-                    return
                 print(f"{GREEN}[ENTRY TRIGGER] CE breakout @ spot {state.spot_ltp}{RESET}")
                 option_map[sid] = sym
                 place_entry(rest, sym, sid, "CE")
         elif should_enter("PE") and state.allowed_side == "PE":
             sym, sid = get_atm_option(state.spot_ltp, "PE", option_index, expiry)
             if sym and sid:
-                option_ltp_check = rest.get_ltp(str(sid), "NSE_FNO")
-                if option_ltp_check is None or option_ltp_check < 10:
-                    print(f"{YELLOW}[ENTRY SKIPPED] PE option illiquid (LTP={option_ltp_check}).{RESET}")
-                    return
                 print(f"{GREEN}[ENTRY TRIGGER] PE breakdown @ spot {state.spot_ltp}{RESET}")
                 option_map[sid] = sym
                 place_entry(rest, sym, sid, "PE")
@@ -809,19 +769,6 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
                     if empty_ticks % EMPTY_TICK_LOG_EVERY == 0:
                         print(f"{YELLOW}No tick data ({empty_ticks} empty reads).{RESET}")
 
-                    # REST fallback while websocket is quiet
-                    if empty_ticks % int(max(1, REST_FALLBACK_INTERVAL_SEC / 0.25)) == 0:
-                        if state.active_security_id:
-                            opt_ltp = rest.get_ltp(str(state.active_security_id), "NSE_FNO")
-                            if opt_ltp is not None:
-                                handle_tick(
-                                    rest,
-                                    {"security_id": str(state.active_security_id), "ltp": opt_ltp},
-                                    option_map,
-                                    option_index,
-                                    expiry,
-                                )
-
                     if empty_ticks > MAX_EMPTY_TICKS:
                         raise ConnectionError("No marketfeed data for extended duration")
                     time.sleep(0.25)
@@ -887,7 +834,7 @@ def main() -> None:
             return
         print(f"Loaded NFO instruments. Using expiry: {next_week_expiry}")
 
-        print("Skipping REST LTP — using WebSocket only")
+        print("Using WebSocket for LTP only")
 
         calculate_auto_signal(rest)
 
