@@ -338,7 +338,7 @@ def download_nfo_master() -> List[dict]:
             for record in reader:
                 symbol = str(record.get("SEM_CUSTOM_SYMBOL", "")).upper()
 
-                if "NIFTY" in symbol:
+                if symbol.startswith("NIFTY"):
                     rows.append(record)
 
         print(f"Loaded {len(rows)} NIFTY instruments")
