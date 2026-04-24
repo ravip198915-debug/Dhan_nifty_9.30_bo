@@ -372,10 +372,13 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
         if not expiry_raw or expiry_raw == "0":
             expiry_raw = str(ins.get("SEM_EXPIRY_CODE", "")).strip()
 
+        if not expiry_raw or expiry_raw == "0":
+            expiry_raw = str(ins.get("EXPIRY", "")).strip()
+
         if not expiry_raw or expiry_raw in ["0", "", "NONE", "NULL"]:
             continue
 
-        print("VALID EXPIRY RAW:", expiry_raw)
+        print("VALID EXPIRY:", expiry_raw)
         expiry = _parse_expiry(expiry_raw)
 
         if not expiry:
@@ -401,6 +404,9 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
         }
 
         expiries.add(expiry)
+
+    if len(expiries) < 2:
+        raise Exception("Insufficient expiry data — check instrument CSV")
 
     if not expiries:
         raise Exception("No valid expiries found — check instrument file")
