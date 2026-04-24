@@ -669,23 +669,20 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
         and not state.skip_trading_today
         and now >= first_entry_time
     ):
-        # Dynamic direction selection by breakout side:
-        # - Break above 9:35 high => CE
-        # - Break below 9:35 low  => PE
-        if should_enter("CE"):
-            state.allowed_side = "CE"
-            sym, sid = get_atm_option(state.spot_ltp, "CE", option_index, expiry)
-            if sym and sid:
-                print(f"{GREEN}[ENTRY TRIGGER] CE breakout @ spot {state.spot_ltp}{RESET}")
-                option_map[sid] = sym
-                place_entry(rest, sym, sid, "CE")
-        elif should_enter("PE"):
-            state.allowed_side = "PE"
-            sym, sid = get_atm_option(state.spot_ltp, "PE", option_index, expiry)
-            if sym and sid:
-                print(f"{GREEN}[ENTRY TRIGGER] PE breakdown @ spot {state.spot_ltp}{RESET}")
-                option_map[sid] = sym
-                place_entry(rest, sym, sid, "PE")
+        if state.spot_ltp >= state.candle.high + 2:
+            side = "CE"
+        elif state.spot_ltp <= state.candle.low - 2:
+            side = "PE"
+        else:
+            return
+
+        state.allowed_side = side
+        sym, sid = get_atm_option(state.spot_ltp, side, option_index, expiry)
+
+        if sym and sid:
+            print(f"[ENTRY TRIGGER] {side} breakout @ spot {state.spot_ltp}")
+            option_map[sid] = sym
+            place_entry(rest, sym, sid, side)
 
     # Management logic
     if state.trade_open and state.option_ltp is not None:
