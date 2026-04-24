@@ -192,20 +192,6 @@ class DhanRestClient:
             return []
         return raw.get("data", []) if isinstance(raw.get("data", []), list) else []
 
-    def historical_intraday_5m(self, security_id: str, on_date: date) -> List[dict]:
-        payload = {
-            "securityId": str(security_id),
-            "exchangeSegment": "NSE_EQ",
-            "instrument": "INDEX",
-            "interval": "5",
-            "fromDate": on_date.strftime("%Y-%m-%d"),
-            "toDate": on_date.strftime("%Y-%m-%d"),
-        }
-        raw = self._request("POST", "/charts/intraday", payload)
-        if not raw:
-            return []
-        return raw.get("data", []) if isinstance(raw.get("data", []), list) else []
-
     def place_order(self, security_id: str, side: str, qty: int) -> Optional[dict]:
         payload = {
             "dhanClientId": self.client_id,
@@ -240,6 +226,10 @@ class BotState:
         self.ma_side: Optional[str] = None
 
         self.candle: Optional[Candle] = None
+        self.candle_high: Optional[float] = None
+        self.candle_low: Optional[float] = None
+        self.candle_ready = False
+        self.skip_trading_today = False
 
         self.active_symbol: Optional[str] = None
         self.active_security_id: Optional[str] = None
@@ -528,40 +518,8 @@ def calculate_auto_signal(rest: DhanRestClient) -> None:
     send_telegram(msg)
 
 
-def fetch_930_candle(rest: DhanRestClient) -> Optional[Candle]:
-    today = date.today()
-
-    data = rest.historical_intraday_5m(SPOT_SECURITY_ID, today)
-
-    # 🔥 fallback if empty
-    if not data:
-        print("No intraday today → trying yesterday")
-        data = rest.historical_intraday_5m(SPOT_SECURITY_ID, today - timedelta(days=1))
-
-    if not data:
-        print("Still no data — API issue")
-        return None
-
-    for row in data:
-        ts = str(row.get("timestamp") or row.get("time") or "")
-        if "09:30" in ts:
-            high = _to_float(row.get("high") or row.get("High"))
-            low = _to_float(row.get("low") or row.get("Low"))
-            if high and low:
-                return Candle(high=high, low=low)
-
-    # fallback first candle
-    first = data[0]
-    high = _to_float(first.get("high") or first.get("High"))
-    low = _to_float(first.get("low") or first.get("Low"))
-
-    if high and low:
-        return Candle(high=high, low=low)
-
-    return None
-
 def should_enter(side: str) -> bool:
-    if state.candle is None or state.spot_ltp is None:
+    if not state.candle_ready or state.candle is None or state.spot_ltp is None:
         return False
 
     if side == "CE":
@@ -700,6 +658,8 @@ def _extract_ticks(response: dict) -> List[dict]:
 
 def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], option_index: dict, expiry: date) -> None:
     now = datetime.now().time()
+    candle_start = dtime(9, 30)
+    candle_end = dtime(9, 35)
 
     secid = str(tick.get("security_id") or tick.get("securityId") or "")
     ltp = _to_float(tick.get("LTP") or tick.get("last_price") or tick.get("ltp"))
@@ -709,6 +669,21 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
     if secid == SPOT_SECURITY_ID:
         state.spot_ltp = ltp
         state.last_any_tick_ts = time.time()
+
+        if candle_start <= now <= candle_end and not state.candle_ready and not state.skip_trading_today:
+            state.candle_high = ltp if state.candle_high is None else max(state.candle_high, ltp)
+            state.candle_low = ltp if state.candle_low is None else min(state.candle_low, ltp)
+        elif now > candle_end and not state.candle_ready and not state.skip_trading_today:
+            if state.candle_high is not None and state.candle_low is not None:
+                state.candle = Candle(high=state.candle_high, low=state.candle_low)
+                state.candle_ready = True
+                print(f"{GREEN}9:35 Candle Built → High={state.candle.high} Low={state.candle.low}{RESET}")
+                send_telegram(f"9:35 Candle Built → High={state.candle.high} Low={state.candle.low}")
+            else:
+                state.skip_trading_today = True
+                print(f"{YELLOW}[NO TRADE] Bot started after 09:35 without candle ticks. Skipping day.{RESET}")
+                send_telegram("[NO TRADE] Bot started after 09:35 and 9:35 candle could not be built.")
+
         now_ts = time.time()
         if now_ts - state.last_spot_log_ts >= 2:
             state.last_spot_log_ts = now_ts
@@ -731,7 +706,14 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
         return
 
     # Entry logic (one trade/day)
-    if not state.trade_open and not state.order_placed and state.auto_ready and state.cpr_type != "WIDE":
+    if (
+        not state.trade_open
+        and not state.order_placed
+        and state.auto_ready
+        and state.cpr_type != "WIDE"
+        and state.candle_ready
+        and not state.skip_trading_today
+    ):
         if not state.allowed_side:
             return
 
@@ -925,19 +907,6 @@ def main() -> None:
             print("No valid NIFTY expiry found in instrument master.")
             return
         print(f"Loaded NFO instruments. Using expiry: {next_week_expiry}")
-
-        # wait until 09:35 for completed 09:30 candle
-        while datetime.now().time() < dtime(9, 35):
-            print("Waiting for 9:35 to fetch 9:30 candle...")
-            time.sleep(5)
-
-        state.candle = fetch_930_candle(rest)
-        if not state.candle:
-            print("Failed to fetch 9:30 candle. Exiting safely.")
-            return
-
-        print(f"{GREEN}Fetched 9:30 candle: High={state.candle.high}, Low={state.candle.low}{RESET}")
-        send_telegram("Fetched 9:30 candle successfully")
 
         # warm-up spot LTP
         state.spot_ltp = rest.get_ltp(SPOT_SECURITY_ID, "IDX_I")
