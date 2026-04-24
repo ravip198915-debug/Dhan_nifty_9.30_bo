@@ -436,7 +436,7 @@ def get_atm_option(spot: float, side: str, option_index: dict, expiry: date) -> 
     return None, None
 
 # ========================== STRATEGY LOGIC ==========================
-def calculate_auto_signal() -> None:
+def calculate_auto_signal():
     print("[AUTO SIGNAL] Using fallback logic (no REST)")
     state.allowed_side = "CE"
     state.auto_signal = "MANUAL"
