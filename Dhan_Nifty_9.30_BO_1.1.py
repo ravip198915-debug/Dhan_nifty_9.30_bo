@@ -297,26 +297,34 @@ def _parse_expiry(value: str) -> Optional[date]:
     if not value:
         return None
 
-    value = value.strip().upper()
+    value = value.strip()
 
-    # 🔥 HANDLE DATETIME FORMAT (YOUR CASE)
+    # remove time part (handles space + T formats)
     if " " in value:
-        value = value.split(" ")[0]   # remove time part
+        value = value.split(" ")[0]
+    if "T" in value:
+        value = value.split("T")[0]
+
+    # remove milliseconds if any
+    if "." in value:
+        value = value.split(".")[0]
 
     formats = [
         "%Y-%m-%d",
         "%d-%b-%Y",
         "%Y/%m/%d",
-        "%d%b%Y",     # 🔥 ADD THIS (MOST IMPORTANT)
+        "%d%b%Y",
         "%d %b %Y",
-        "%Y%m%d",   
+        "%Y%m%d",
     ]
 
     for fmt in formats:
         try:
             return datetime.strptime(value.strip(), fmt).date()
-        except Exception:
+        except:
             continue
+
+    print("FAILED PARSE:", value)
     return None
 
 import csv
