@@ -367,18 +367,27 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
         if not symbol.startswith("NIFTY"):
             continue
 
-        expiry_raw = str(ins.get("SEM_EXPIRY_DATE", "")).strip()
+        expiry_raw = None
 
-        if not expiry_raw or expiry_raw == "0":
-            expiry_raw = str(ins.get("SEM_EXPIRY_CODE", "")).strip()
+        for key in [
+            "SEM_EXPIRY_DATE",
+            "SEM_EXPIRY_CODE",
+            "EXPIRY",
+            "EXPIRY_DATE",
+            "EXPIRY_DT",
+            "EXPIRYDATE",
+            "SEM_EXPIRY",
+            "expiry"
+        ]:
+            val = str(ins.get(key, "")).strip()
+            if val and val not in ["0", "NONE", "NULL"]:
+                expiry_raw = val
+                break
 
-        if not expiry_raw or expiry_raw == "0":
-            expiry_raw = str(ins.get("EXPIRY", "")).strip()
-
-        if not expiry_raw or expiry_raw in ["0", "", "NONE", "NULL"]:
+        if not expiry_raw:
             continue
 
-        print("VALID EXPIRY:", expiry_raw)
+        print(f"USING EXPIRY: {expiry_raw}")
         expiry = _parse_expiry(expiry_raw)
 
         if not expiry:
