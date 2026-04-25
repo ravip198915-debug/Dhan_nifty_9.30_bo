@@ -344,9 +344,9 @@ def download_nfo_master() -> List[dict]:
             reader = csv.DictReader(f)
 
             for record in reader:
-                symbol = str(record.get("SEM_CUSTOM_SYMBOL", "")).upper()
+                trading_symbol = str(record.get("SEM_TRADING_SYMBOL", "")).upper()
 
-                if symbol.startswith("NIFTY"):
+                if trading_symbol.startswith("NIFTY"):
                     rows.append(record)
 
         print(f"Loaded {len(rows)} NIFTY instruments")
