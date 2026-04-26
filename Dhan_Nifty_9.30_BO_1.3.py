@@ -431,6 +431,7 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
         selected_expiry = sorted(expiries)[-1]
 
     print("Selected expiry:", selected_expiry)
+    print(f"Option index size: {len(option_index)}")
 
     return option_index, selected_expiry
 
@@ -438,10 +439,15 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
 def get_atm_option(spot: float, side: str, option_index: dict, expiry: date) -> Tuple[Optional[str], Optional[str]]:
     strike = round(spot / 50) * 50
 
-    for s in [strike, strike + 50, strike - 50, strike + 100, strike - 100]:
-        row = option_index.get((expiry, int(s), side))
-        if row:
-            return row["symbol"], str(row["security_id"])
+    row = option_index.get((expiry, strike, side))
+    if row:
+        return row["symbol"], str(row["security_id"])
+
+    for diff in [50, 100]:
+        for s in [strike + diff, strike - diff]:
+            row = option_index.get((expiry, int(s), side))
+            if row:
+                return row["symbol"], str(row["security_id"])
 
     return None, None
 
@@ -684,10 +690,13 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
         state.allowed_side = side
         sym, sid = get_atm_option(state.spot_ltp, side, option_index, expiry)
 
-        if sym and sid:
-            print(f"[ENTRY TRIGGER] {side} breakout @ spot {state.spot_ltp}")
-            option_map[sid] = sym
-            place_entry(rest, sym, sid, side)
+        if not sym or not sid:
+            print("[ENTRY BLOCKED] No valid ATM option found")
+            return
+
+        print(f"[ENTRY TRIGGER] {side} breakout @ spot {state.spot_ltp}")
+        option_map[sid] = sym
+        place_entry(rest, sym, sid, side)
 
     # Management logic
     if state.trade_open and state.option_ltp is not None:
@@ -834,8 +843,14 @@ def main() -> None:
             print("[FATAL] Instrument master unavailable. Exiting safely.")
             return
         option_index, next_week_expiry = build_option_index(instruments)
+        if len(option_index) < 100:
+            print("[FATAL] Option index too small — CSV may be corrupted")
+            return
         if not next_week_expiry:
             print("No valid NIFTY expiry found in instrument master.")
+            return
+        if next_week_expiry < date.today():
+            print("[FATAL] Expiry is in past — aborting")
             return
         print(f"Loaded NFO instruments. Using expiry: {next_week_expiry}")
 
