@@ -345,9 +345,21 @@ def download_nfo_master() -> List[dict]:
 
             for record in reader:
                 trading_symbol = str(record.get("SEM_TRADING_SYMBOL", "")).upper()
+                instrument_type = str(record.get("SEM_INSTRUMENT_NAME", "")).upper()
+                exchange = str(record.get("SEM_EXM_EXCH_ID", "")).upper()
 
-                if trading_symbol.startswith("NIFTY"):
+                # STRICT filter for NIFTY index options only
+                if (
+                    exchange == "NSE"
+                    and instrument_type == "OPTIDX"
+                    and trading_symbol.startswith("NIFTY")
+                    and "NIFTYNXT50" not in trading_symbol
+                ):
                     rows.append(record)
+
+        if not rows:
+            print("[FATAL] No NIFTY options found in CSV. Check instrument file.")
+            return []
 
         print(f"Loaded {len(rows)} NIFTY instruments")
 
@@ -375,24 +387,9 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
         if not symbol.startswith("NIFTY"):
             continue
 
-        expiry_raw = None
-
-        for key in [
-            "SEM_EXPIRY_DATE",
-            "SEM_EXPIRY_CODE",
-            "EXPIRY",
-            "EXPIRY_DATE",
-            "EXPIRY_DT",
-            "EXPIRYDATE",
-            "SEM_EXPIRY",
-            "expiry"
-        ]:
-            val = str(ins.get(key, "")).strip()
-            if val and val not in ["0", "NONE", "NULL"]:
-                expiry_raw = val
-                break
-
-        if not expiry_raw:
+        expiry_raw = ins.get("SEM_EXPIRY_DATE")
+        if not expiry_raw or str(expiry_raw) in ["0", "", None]:
+            print("FAILED EXPIRY RAW:", expiry_raw)
             continue
 
         print(f"USING EXPIRY: {expiry_raw}")
