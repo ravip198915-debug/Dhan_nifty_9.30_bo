@@ -774,7 +774,25 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
                         send_telegram(alert)
 
                 try:
-                    response = state.feed_client.get_data()
+                    response = None
+
+                    try:
+                        data = state.feed_client.get_data()
+
+                        # handle async coroutine case
+                        if hasattr(data, "__await__"):
+                            import asyncio
+                            try:
+                                response = asyncio.run(data)
+                            except RuntimeError:
+                                # event loop already running → fallback
+                                response = None
+                        else:
+                            response = data
+
+                    except Exception as e:
+                        print(f"[GET_DATA ERROR] {e}")
+                        response = None
 
                     if response:
                         empty_ticks = 0
