@@ -751,7 +751,6 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
 
         try:
             state.feed_client = marketfeed.DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments, "v2")
-            state.feed_client.run_forever()
             state.last_any_tick_ts = time.time()
 
             empty_ticks = 0
