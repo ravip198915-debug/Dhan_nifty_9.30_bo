@@ -382,10 +382,7 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
     expiries = set()
 
     for ins in instruments:
-        symbol = str(ins.get("SEM_CUSTOM_SYMBOL", "")).upper()
-
-        if not symbol.startswith("NIFTY"):
-            continue
+        symbol = str(ins.get("SEM_TRADING_SYMBOL", "")).upper()
 
         expiry_raw = ins.get("SEM_EXPIRY_DATE")
         if not expiry_raw or str(expiry_raw) in ["0", "", None]:
