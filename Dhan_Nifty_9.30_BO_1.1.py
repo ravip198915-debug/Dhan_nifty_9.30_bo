@@ -297,72 +297,50 @@ def _parse_expiry(value: str) -> Optional[date]:
     if not value:
         return None
 
-    value = value.strip()
+    value = str(value).split("T")[0].split(" ")[0].strip()
 
-    # remove time part (handles space + T formats)
-    if " " in value:
-        value = value.split(" ")[0]
-    if "T" in value:
-        value = value.split("T")[0]
-
-    # remove milliseconds if any
-    if "." in value:
-        value = value.split(".")[0]
-
-    formats = [
-        "%Y-%m-%d",
-        "%d-%b-%Y",
-        "%Y/%m/%d",
-        "%d%b%Y",
-        "%d %b %Y",
-        "%Y%m%d",
-    ]
-
-    for fmt in formats:
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%Y%m%d"):
         try:
-            return datetime.strptime(value.strip(), fmt).date()
+            return datetime.strptime(value, fmt).date()
         except:
             continue
 
     print("FAILED PARSE:", value)
     return None
 
-import csv
+def fetch_dhan_instruments() -> List[dict]:
+    print("Fetching instruments from Dhan API...")
 
-def download_nfo_master() -> List[dict]:
-    file_path = "api-scrip-master.csv"
-    rows: List[dict] = []
+    url = "https://api.dhan.co/v2/instruments"
+    headers = {"access-token": ACCESS_TOKEN}
 
     try:
-        if not os.path.exists(file_path):
-            print("Instrument file not found!")
-            return rows
+        response = requests.get(url, headers=headers, timeout=15)
 
-        print("Using local instrument file (FINAL FIX)...")
+        if response.status_code != 200:
+            print(f"[ERROR] Failed to fetch instruments: {response.status_code}")
+            return []
 
-        with open(file_path, "r", newline='', encoding="utf-8") as f:
-            reader = csv.DictReader(f)
+        data = response.json()
 
-            for record in reader:
-                trading_symbol = str(record.get("SEM_TRADING_SYMBOL", "")).upper()
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
 
-                if trading_symbol.startswith("NIFTY"):
-                    rows.append(record)
+        if not isinstance(data, list):
+            print("[ERROR] Invalid instrument format")
+            return []
 
-        print(f"Loaded {len(rows)} NIFTY instruments")
+        nifty_rows = [
+            ins for ins in data
+            if str(ins.get("tradingSymbol", "")).upper().startswith("NIFTY")
+        ]
 
-    except Exception as exc:
-        print(f"Instrument load error: {exc}")
+        print(f"Loaded {len(nifty_rows)} NIFTY instruments from API")
+        return nifty_rows
 
-    return rows
-
-def download_nfo_master_with_retry() -> List[dict]:
-    rows = download_nfo_master()
-    if rows:
-        return rows
-    print(f"{YELLOW}Instrument download failed/empty. Retrying once...{RESET}")
-    time.sleep(1)
-    return download_nfo_master()
+    except Exception as e:
+        print(f"[ERROR] Instrument fetch failed: {e}")
+        return []
 
 
 def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, str], dict], Optional[date]]:
@@ -370,39 +348,27 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
     expiries = set()
 
     for ins in instruments:
-        symbol = str(ins.get("SEM_CUSTOM_SYMBOL", "")).upper()
+        symbol = str(ins.get("tradingSymbol", "")).upper()
 
         if not symbol.startswith("NIFTY"):
             continue
 
-        expiry_raw = None
-
-        for key in [
-            "SEM_EXPIRY_DATE",
-            "SEM_EXPIRY_CODE",
-            "EXPIRY",
-            "EXPIRY_DATE",
-            "EXPIRY_DT",
-            "EXPIRYDATE",
-            "SEM_EXPIRY",
-            "expiry"
-        ]:
-            val = str(ins.get(key, "")).strip()
-            if val and val not in ["0", "NONE", "NULL"]:
-                expiry_raw = val
-                break
+        expiry_raw = (
+            ins.get("expiryDate")
+            or ins.get("expiry")
+            or ins.get("EXPIRY_DATE")
+        )
 
         if not expiry_raw:
             continue
 
-        print(f"USING EXPIRY: {expiry_raw}")
         expiry = _parse_expiry(expiry_raw)
 
         if not expiry:
             print("FAILED PARSE:", expiry_raw)
             continue
 
-        opt_raw = str(ins.get("SEM_OPTION_TYPE", "")).upper()
+        opt_raw = str(ins.get("optionType", "")).upper()
         if "CE" in opt_raw or "CALL" in opt_raw:
             opt_type = "CE"
         elif "PE" in opt_raw or "PUT" in opt_raw:
@@ -411,26 +377,26 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
             continue
 
         try:
-            strike = int(float(ins.get("SEM_STRIKE_PRICE", "0")))
+            strike = int(float(ins.get("strikePrice", 0)))
         except Exception:
             continue
 
         option_index[(expiry, strike, opt_type)] = {
-            "symbol": ins.get("SEM_TRADING_SYMBOL"),
-            "security_id": ins.get("SEM_SMST_SECURITY_ID"),
+            "symbol": ins.get("tradingSymbol"),
+            "security_id": ins.get("securityId"),
         }
 
         expiries.add(expiry)
 
     if not expiries:
-        raise Exception("No valid expiries found — check instrument file")
+        print("Total valid expiries found: 0")
+        return option_index, None
 
     print(f"Total valid expiries found: {len(expiries)}")
 
     sorted_exp = sorted(expiries)
     today = date.today()
-
-    future_exp = [d for d in sorted_exp if d >= today]
+    future_exp = [d for d in sorted_exp if d > today]
 
     if len(future_exp) >= 2:
         selected_expiry = future_exp[1]
@@ -438,8 +404,8 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
         print("Only one expiry available — using it")
         selected_expiry = future_exp[0]
     else:
-        print("Fallback: using last available expiry")
-        selected_expiry = sorted_exp[-1] if sorted_exp else None
+        print("No future expiry available")
+        selected_expiry = None
 
     print("Available expiries:", sorted_exp[:10])
     print("Selected expiry:", selected_expiry)
@@ -840,14 +806,13 @@ def main() -> None:
         _ = dhanhq(CLIENT_ID, ACCESS_TOKEN)
         rest = DhanRestClient(CLIENT_ID, ACCESS_TOKEN)
 
-        print("Downloading instruments...")
-        instruments = download_nfo_master_with_retry()
+        instruments = fetch_dhan_instruments()
         if not instruments:
-            print("[FATAL] Instrument master unavailable after retry. Exiting.")
+            print("[FATAL] Instrument master unavailable. Exiting.")
             return
         option_index, next_week_expiry = build_option_index(instruments)
         if not next_week_expiry:
-            print("No valid NIFTY expiry found in instrument master.")
+            print("No valid NIFTY expiry found in instruments.")
             return
         print(f"Loaded NFO instruments. Using expiry: {next_week_expiry}")
 
