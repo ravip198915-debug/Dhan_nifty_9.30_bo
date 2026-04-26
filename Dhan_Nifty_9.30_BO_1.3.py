@@ -750,7 +750,7 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
             instruments.append((marketfeed.NSE_FNO, str(state.active_security_id), marketfeed.Ticker))
 
         try:
-            state.feed_client = marketfeed.DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments, "v2")
+            state.feed_client = marketfeed.DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments)
             state.last_any_tick_ts = time.time()
 
             empty_ticks = 0
