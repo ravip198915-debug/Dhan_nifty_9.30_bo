@@ -785,7 +785,7 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
                             try:
                                 response = asyncio.run(data)
                             except RuntimeError:
-                                # event loop already running → fallback
+                                # event loop already running → skip this cycle
                                 response = None
                         else:
                             response = data
@@ -794,18 +794,25 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
                         print(f"[GET_DATA ERROR] {e}")
                         response = None
 
-                    if response:
+                    if response and isinstance(response, dict):
                         empty_ticks = 0
                         reconnect_delay = RECONNECT_BASE_DELAY
+
                         ticks = _extract_ticks(response)
-                        for tick in ticks:
-                            handle_tick(rest, tick, option_map, option_index, expiry)
+
+                        if not ticks:
+                            empty_ticks += 1
+                        else:
+                            for tick in ticks:
+                                handle_tick(rest, tick, option_map, option_index, expiry)
                     else:
                         empty_ticks += 1
-                        if empty_ticks % EMPTY_TICK_LOG_EVERY == 0:
-                            print(f"{YELLOW}No tick data ({empty_ticks} empty reads).{RESET}")
-                        if empty_ticks > MAX_EMPTY_TICKS:
-                            raise ConnectionError("No marketfeed data for extended duration")
+
+                    if empty_ticks % EMPTY_TICK_LOG_EVERY == 0 and empty_ticks > 0:
+                        print(f"{YELLOW}No tick data ({empty_ticks} empty reads).{RESET}")
+                    if empty_ticks > MAX_EMPTY_TICKS:
+                        raise ConnectionError("No marketfeed data for extended duration")
+                    if empty_ticks > 0:
                         time.sleep(0.25)
 
                 except Exception as e:
