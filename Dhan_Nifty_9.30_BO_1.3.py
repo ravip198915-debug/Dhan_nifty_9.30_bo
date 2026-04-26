@@ -777,6 +777,17 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
                     response = None
 
                     try:
+                        # Ensure feed client exists
+                        if not state.feed_client:
+                            time.sleep(0.5)
+                            continue
+
+                        # Check if websocket exists internally
+                        ws = getattr(state.feed_client, "ws", None)
+                        if ws is None:
+                            # connection not ready yet -> trigger outer reconnect logic
+                            raise ConnectionError("WebSocket not initialized")
+
                         data = state.feed_client.get_data()
 
                         # handle async coroutine case
