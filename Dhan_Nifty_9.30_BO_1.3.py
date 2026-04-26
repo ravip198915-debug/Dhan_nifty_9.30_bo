@@ -216,7 +216,6 @@ class BotState:
         self.trade_logged = False
         self.pending_trade_row: Optional[dict] = None
         self.feed_client = None
-        self.feed_thread: Optional[threading.Thread] = None
 
 
 state = BotState()
@@ -720,14 +719,13 @@ def handle_tick(rest: DhanRestClient, tick: dict, option_map: Dict[str, str], op
 def close_marketfeed_connection() -> None:
     if state.feed_client is not None:
         try:
-            state.feed_client.close()
-            print(f"{YELLOW}WebSocket connection closed cleanly.{RESET}")
+            disconnect = getattr(state.feed_client, "disconnect", None)
+            if callable(disconnect):
+                disconnect()
+                print(f"{YELLOW}WebSocket disconnected cleanly.{RESET}")
         except Exception as close_exc:
-            print(f"{YELLOW}WebSocket close warning: {close_exc}{RESET}")
-    if state.feed_thread is not None and state.feed_thread.is_alive():
-        state.feed_thread.join(timeout=2)
+            print(f"{YELLOW}WebSocket disconnect warning: {close_exc}{RESET}")
     state.feed_client = None
-    state.feed_thread = None
 
 
 def flush_pending_trade_log() -> None:
@@ -753,8 +751,7 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
 
         try:
             state.feed_client = marketfeed.DhanFeed(CLIENT_ID, ACCESS_TOKEN, instruments, "v2")
-            state.feed_thread = threading.Thread(target=state.feed_client.run_forever, daemon=True)
-            state.feed_thread.start()
+            state.feed_client.run_forever()
             state.last_any_tick_ts = time.time()
 
             empty_ticks = 0
@@ -777,24 +774,26 @@ def run_marketfeed_loop(rest: DhanRestClient, option_index: dict, expiry: date) 
                         print(f"{YELLOW}{alert}{RESET}")
                         send_telegram(alert)
 
-                response = state.feed_client.get_data()
-                if not response:
-                    empty_ticks += 1
-                    if empty_ticks % EMPTY_TICK_LOG_EVERY == 0:
-                        print(f"{YELLOW}No tick data ({empty_ticks} empty reads).{RESET}")
+                try:
+                    response = state.feed_client.get_data()
 
-                    if empty_ticks > MAX_EMPTY_TICKS:
-                        raise ConnectionError("No marketfeed data for extended duration")
-                    time.sleep(0.25)
-                    continue
+                    if response:
+                        empty_ticks = 0
+                        reconnect_delay = RECONNECT_BASE_DELAY
+                        ticks = _extract_ticks(response)
+                        for tick in ticks:
+                            handle_tick(rest, tick, option_map, option_index, expiry)
+                    else:
+                        empty_ticks += 1
+                        if empty_ticks % EMPTY_TICK_LOG_EVERY == 0:
+                            print(f"{YELLOW}No tick data ({empty_ticks} empty reads).{RESET}")
+                        if empty_ticks > MAX_EMPTY_TICKS:
+                            raise ConnectionError("No marketfeed data for extended duration")
+                        time.sleep(0.25)
 
-                empty_ticks = 0
-                reconnect_delay = RECONNECT_BASE_DELAY
-                ticks = _extract_ticks(response)
-                if not ticks:
-                    continue
-                for tick in ticks:
-                    handle_tick(rest, tick, option_map, option_index, expiry)
+                except Exception as e:
+                    print(f"[FEED ERROR] {e}")
+                    time.sleep(2)
 
         except KeyboardInterrupt:
             state.day_closed = True
