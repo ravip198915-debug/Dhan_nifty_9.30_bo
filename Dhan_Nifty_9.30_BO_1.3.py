@@ -321,10 +321,9 @@ def _parse_expiry(value: str) -> Optional[date]:
     for fmt in formats:
         try:
             return datetime.strptime(value.strip(), fmt).date()
-        except:
+        except Exception:
             continue
 
-    print("FAILED PARSE:", value)
     return None
 
 import csv
@@ -358,7 +357,7 @@ def download_nfo_master() -> List[dict]:
                     rows.append(record)
 
         if not rows:
-            print("[FATAL] No NIFTY options found in CSV. Check instrument file.")
+            print("[FATAL] No NIFTY options found in CSV. Check file.")
             return []
 
         print(f"Loaded {len(rows)} NIFTY instruments")
@@ -383,17 +382,24 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
 
     for ins in instruments:
         symbol = str(ins.get("SEM_TRADING_SYMBOL", "")).upper()
+        instrument_type = str(ins.get("SEM_INSTRUMENT_NAME", "")).upper()
+        exchange = str(ins.get("SEM_EXM_EXCH_ID", "")).upper()
+
+        if not (
+            exchange == "NSE"
+            and instrument_type == "OPTIDX"
+            and symbol.startswith("NIFTY")
+            and "NIFTYNXT50" not in symbol
+        ):
+            continue
 
         expiry_raw = ins.get("SEM_EXPIRY_DATE")
         if not expiry_raw or str(expiry_raw) in ["0", "", None]:
-            print("FAILED EXPIRY RAW:", expiry_raw)
             continue
 
-        print(f"USING EXPIRY: {expiry_raw}")
         expiry = _parse_expiry(expiry_raw)
 
         if not expiry:
-            print("FAILED PARSE:", expiry_raw)
             continue
 
         opt_raw = str(ins.get("SEM_OPTION_TYPE", "")).upper()
@@ -417,25 +423,20 @@ def build_option_index(instruments: List[dict]) -> Tuple[Dict[Tuple[date, int, s
         expiries.add(expiry)
 
     if not expiries:
-        raise Exception("No valid expiries found — check instrument file")
+        raise Exception("[FATAL] No valid expiries found — invalid CSV or filter")
 
     print(f"Total valid expiries found: {len(expiries)}")
 
-    sorted_exp = sorted(expiries)
     today = date.today()
-
-    future_exp = [d for d in sorted_exp if d >= today]
+    future_exp = sorted([d for d in expiries if d >= today])
 
     if len(future_exp) >= 2:
         selected_expiry = future_exp[1]
-    elif len(future_exp) == 1:
-        print("Only one expiry available — using it")
+    elif future_exp:
         selected_expiry = future_exp[0]
     else:
-        print("Fallback: using last available expiry")
-        selected_expiry = sorted_exp[-1] if sorted_exp else None
+        selected_expiry = sorted(expiries)[-1]
 
-    print("Available expiries:", sorted_exp[:10])
     print("Selected expiry:", selected_expiry)
 
     return option_index, selected_expiry
